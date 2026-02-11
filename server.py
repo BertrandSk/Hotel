@@ -6,6 +6,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import json
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
@@ -21,6 +22,8 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 import base64
+from pywebpush import webpush, WebPushException
+from py_vapid import Vapid
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -34,6 +37,37 @@ db = client[os.environ['DB_NAME']]
 SECRET_KEY = os.environ.get('JWT_SECRET', 'hotel-secret-key-change-in-production')
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
+
+# VAPID Configuration for Push Notifications
+# Generate keys if not exists
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '')
+VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', '')
+VAPID_EMAIL = os.environ.get('VAPID_EMAIL', 'mailto:admin@lavilladelice.com')
+
+# Generate VAPID keys if not provided
+if not VAPID_PRIVATE_KEY or not VAPID_PUBLIC_KEY:
+    vapid_keys_file = ROOT_DIR / 'vapid_keys.json'
+    if vapid_keys_file.exists():
+        with open(vapid_keys_file, 'r') as f:
+            keys = json.load(f)
+            VAPID_PRIVATE_KEY = keys['private_key']
+            VAPID_PUBLIC_KEY = keys['public_key']
+    else:
+        # Generate new keys using py_vapid
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+        vapid = Vapid()
+        vapid.generate_keys()
+        VAPID_PRIVATE_KEY = vapid.private_pem().decode('utf-8')
+        # Get uncompressed public key and encode to urlsafe base64
+        raw_pub = vapid.public_key.public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        VAPID_PUBLIC_KEY = base64.urlsafe_b64encode(raw_pub).decode('utf-8').rstrip('=')
+        # Save keys
+        with open(vapid_keys_file, 'w') as f:
+            json.dump({
+                'private_key': VAPID_PRIVATE_KEY,
+                'public_key': VAPID_PUBLIC_KEY
+            }, f)
+        print(f"Generated new VAPID keys")
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -60,6 +94,8 @@ class UserRole:
     ADMIN = "admin"
     STAFF = "staff"
     GUEST = "guest"
+    SERVEUR = "serveur"
+    CUISINIER = "cuisinier"
 
 class UserBase(BaseModel):
     email: str
@@ -159,6 +195,11 @@ class Order(BaseModel):
     room_number: Optional[str] = ""
     table_number: Optional[str] = ""
     notes: Optional[str] = ""
+    created_by: Optional[str] = ""  # Who created this order/invoice
+    created_by_name: Optional[str] = ""  # Name of the creator
+    deleted_by: Optional[str] = ""  # Who deleted (if deleted)
+    deleted_by_name: Optional[str] = ""  # Name of who deleted
+    deleted_at: Optional[datetime] = None  # When deleted
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class OrderCreate(BaseModel):
@@ -221,6 +262,8 @@ class DirectInvoice(BaseModel):
     room_number: Optional[str] = ""
     notes: Optional[str] = ""
     status: str = "paid"  # paid, pending, cancelled
+    created_by: Optional[str] = ""  # Who created this invoice
+    created_by_name: Optional[str] = ""  # Name of the creator
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class DirectInvoiceCreate(BaseModel):
@@ -231,6 +274,25 @@ class DirectInvoiceCreate(BaseModel):
     payment_method: str = "cash"
     room_number: Optional[str] = ""
     notes: Optional[str] = ""
+
+# Push Notification Models
+class PushSubscriptionKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+class PushSubscription(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    endpoint: str
+    keys: PushSubscriptionKeys
+    user_agent: Optional[str] = ""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class PushSubscriptionCreate(BaseModel):
+    endpoint: str
+    keys: PushSubscriptionKeys
+    user_agent: Optional[str] = ""
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -465,8 +527,7 @@ async def create_direct_invoice(invoice_data: DirectInvoiceCreate, current_user:
     """Create a direct invoice (for restaurant billing)"""
     # Calculate totals
     subtotal = sum(item.price * item.quantity for item in invoice_data.items)
-    tax = subtotal * 0.1
-    total = subtotal + tax
+    total = subtotal  # Sans TVA
     
     # Generate invoice number
     count = await db.direct_invoices.count_documents({})
@@ -479,11 +540,13 @@ async def create_direct_invoice(invoice_data: DirectInvoiceCreate, current_user:
         customer_phone=invoice_data.customer_phone,
         items=invoice_data.items,
         subtotal=subtotal,
-        tax=tax,
+        tax=0,
         total=total,
         payment_method=invoice_data.payment_method,
         room_number=invoice_data.room_number,
-        notes=invoice_data.notes
+        notes=invoice_data.notes,
+        created_by=current_user.email,
+        created_by_name=current_user.name
     )
     
     # Deduct stock for tracked items
@@ -545,16 +608,12 @@ async def generate_direct_invoice_pdf(invoice_id: str):
     elements.append(Paragraph("Q. Les volcans, Avenue Grevaillas", small_style))
     elements.append(Paragraph("Numero 076 Goma Nord Kivu", small_style))
     elements.append(Paragraph("Tél: 980629999", small_style))
-    elements.append(Spacer(1, 10))
-    
-    # Separator line
-    elements.append(Paragraph("=" * 35, center_style))
     elements.append(Spacer(1, 5))
+    elements.append(Paragraph("-" * 35, center_style))
     
     # Invoice info
     elements.append(Paragraph(f"<b>{invoice.get('invoice_number', '')}</b>", bold_center))
     elements.append(Paragraph(datetime.fromisoformat(invoice.get("created_at", datetime.now(timezone.utc).isoformat())).strftime("%d/%m/%Y %H:%M"), center_style))
-    elements.append(Spacer(1, 5))
     
     if invoice.get("customer_name"):
         elements.append(Paragraph(f"Client: {invoice.get('customer_name')}", center_style))
@@ -564,42 +623,41 @@ async def generate_direct_invoice_pdf(invoice_id: str):
     payment_labels = {"cash": "Espèces", "card": "Carte Bancaire", "room_charge": "Note Chambre"}
     elements.append(Paragraph(f"Paiement: {payment_labels.get(invoice.get('payment_method', 'cash'), 'Espèces')}", center_style))
     
-    elements.append(Spacer(1, 5))
     elements.append(Paragraph("-" * 35, center_style))
-    elements.append(Spacer(1, 5))
+    
+    # Items header
+    elements.append(Paragraph("Qté  Article              Total", ParagraphStyle('Header', parent=styles['Normal'], fontSize=8, fontName='Courier-Bold')))
+    elements.append(Paragraph("-" * 35, center_style))
     
     # Items
     for item in invoice.get("items", []):
-        qty = item.get("quantity", 0)
-        name = item.get("name", "")[:20]  # Truncate long names
-        price = item.get("price", 0)
-        total = qty * price
-        
-        # Item line
-        item_text = f"{qty}x {name}"
-        elements.append(Paragraph(item_text, ParagraphStyle('Item', parent=styles['Normal'], fontSize=9)))
-        elements.append(Paragraph(f"{total:.2f} $", ParagraphStyle('ItemPrice', parent=styles['Normal'], fontSize=9, alignment=2)))
+        qty = str(item.get("quantity", 0)).ljust(3)
+        name = item.get("name", "")[:18].ljust(18)
+        total = f"{item.get('price', 0) * item.get('quantity', 0):.2f} $"
+        elements.append(Paragraph(f"{qty} {name} {total}", ParagraphStyle('Item', parent=styles['Normal'], fontSize=8, fontName='Courier')))
     
-    elements.append(Spacer(1, 5))
     elements.append(Paragraph("-" * 35, center_style))
-    elements.append(Spacer(1, 5))
     
     # Totals (sans TVA)
     subtotal = invoice.get('subtotal', 0)
     total = subtotal
     
     elements.append(Paragraph(f"Sous-total: {subtotal:.2f} $", ParagraphStyle('Subtotal', parent=styles['Normal'], fontSize=9, alignment=2)))
-    elements.append(Spacer(1, 3))
     elements.append(Paragraph("=" * 35, center_style))
-    elements.append(Paragraph(f"<b>TOTAL: {total:.2f} $</b>", ParagraphStyle('Total', parent=styles['Normal'], fontSize=12, fontName='Helvetica-Bold', alignment=2)))
+    elements.append(Paragraph(f"<b>TOTAL: {total:.2f} $</b>", ParagraphStyle('Total', parent=styles['Normal'], fontSize=12, fontName='Helvetica-Bold', alignment=1)))
     elements.append(Paragraph("=" * 35, center_style))
     
-    elements.append(Spacer(1, 10))
+    elements.append(Spacer(1, 5))
+    
+    # Who created the invoice
+    if invoice.get("created_by_name"):
+        elements.append(Paragraph(f"Facturé par: {invoice.get('created_by_name')}", small_style))
+    
+    elements.append(Spacer(1, 5))
     
     # Footer
-    elements.append(Paragraph("Merci de votre visite !", bold_center))
-    elements.append(Paragraph("La Villa Delice", center_style))
-    elements.append(Spacer(1, 5))
+    elements.append(Paragraph("Merci de votre visite !", center_style))
+    elements.append(Paragraph("La Villa Delice", small_style))
     
     doc.build(elements)
     buffer.seek(0)
@@ -830,165 +888,119 @@ async def get_booking_invoice(booking_id: str):
 
 @api_router.get("/bookings/{booking_id}/invoice/pdf")
 async def generate_booking_invoice_pdf(booking_id: str):
-    """Generate PDF invoice for a room booking including restaurant items"""
+    """Generate PDF invoice for a room booking including restaurant items - Thermal format"""
     booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
     
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
+    # Format ticket thermique 80mm
+    page_width = 226
+    doc = SimpleDocTemplate(buffer, pagesize=(page_width, 900), rightMargin=10, leftMargin=10, topMargin=15, bottomMargin=15)
     elements = []
     
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'InvoiceTitle',
-        parent=styles['Heading1'],
-        fontSize=28,
-        spaceAfter=10,
-        textColor=colors.HexColor('#0F2C25')
-    )
-    subtitle_style = ParagraphStyle(
-        'Subtitle',
-        parent=styles['Heading2'],
-        fontSize=16,
-        spaceAfter=10,
-        textColor=colors.HexColor('#C5A059')
-    )
     
-    # Header
-    elements.append(Paragraph("La Villa Delice", title_style))
-    elements.append(Paragraph("Facture Complète", styles['Normal']))
-    elements.append(Spacer(1, 20))
+    # Styles ticket thermique
+    title_style = ParagraphStyle('ThermalTitle', parent=styles['Normal'], fontSize=14, fontName='Helvetica-Bold', alignment=1, spaceAfter=5)
+    center_style = ParagraphStyle('ThermalCenter', parent=styles['Normal'], fontSize=9, alignment=1, spaceAfter=3)
+    small_style = ParagraphStyle('ThermalSmall', parent=styles['Normal'], fontSize=8, alignment=1, spaceAfter=2)
+    section_style = ParagraphStyle('ThermalSection', parent=styles['Normal'], fontSize=10, fontName='Helvetica-Bold', alignment=1, spaceBefore=5, spaceAfter=3)
     
-    # Invoice details
-    invoice_info = [
-        ["FACTURE", f"HTL-{booking_id[:8].upper()}"],
-        ["Date d'émission", datetime.now().strftime("%d/%m/%Y")],
-        ["Client", booking.get("guest_name", "")],
-    ]
-    if booking.get("guest_email"):
-        invoice_info.append(["Email", booking.get("guest_email")])
-    if booking.get("guest_phone"):
-        invoice_info.append(["Téléphone", booking.get("guest_phone")])
+    # Header - La Villa Delice
+    elements.append(Paragraph("LA VILLA DELICE", title_style))
+    elements.append(Paragraph("Restaurant & Bar", center_style))
+    elements.append(Paragraph("Q. Les volcans, Avenue Grevaillas", small_style))
+    elements.append(Paragraph("Numero 076 Goma Nord Kivu", small_style))
+    elements.append(Paragraph("Tél: 980629999", small_style))
+    elements.append(Spacer(1, 5))
+    elements.append(Paragraph("-" * 35, center_style))
     
-    info_table = Table(invoice_info, colWidths=[4*cm, 11*cm])
-    info_table.setStyle(TableStyle([
-        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 11),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-    ]))
-    elements.append(info_table)
-    elements.append(Spacer(1, 25))
+    # Invoice info
+    elements.append(Paragraph("FACTURE SÉJOUR", section_style))
+    elements.append(Paragraph(f"N°: HTL-{booking_id[:8].upper()}", small_style))
+    elements.append(Paragraph(f"Date: {datetime.now().strftime('%d/%m/%Y %H:%M')}", small_style))
+    elements.append(Paragraph(f"Client: {booking.get('guest_name', '')}", small_style))
+    elements.append(Paragraph("-" * 35, center_style))
     
-    # Room details section
-    elements.append(Paragraph("HÉBERGEMENT", subtitle_style))
-    
+    # Room details
+    elements.append(Paragraph("HÉBERGEMENT", section_style))
     room_type_labels = {"single": "Simple", "double": "Double", "suite": "Suite"}
-    room_data = [
-        ["Description", "Détail", "Montant"],
-        [
-            f"Chambre N° {booking.get('room_number', '')}",
-            f"{room_type_labels.get(booking.get('room_type', ''), '')} - {booking.get('nights', 0)} nuit(s)",
-            f"{booking.get('total_price', 0):.2f} $"
-        ],
-        [
-            "Dates",
-            f"Du {booking.get('check_in', '')} au {booking.get('check_out', '')}",
-            ""
-        ],
-        [
-            "Tarif",
-            f"{booking.get('price_per_night', 0):.2f} $ / nuit",
-            ""
-        ]
+    room_info = [
+        [f"Chambre N° {booking.get('room_number', '')}", ""],
+        [f"{room_type_labels.get(booking.get('room_type', ''), '')}", f"{booking.get('nights', 0)} nuit(s)"],
+        [f"Du {booking.get('check_in', '')}", ""],
+        [f"Au {booking.get('check_out', '')}", ""],
+        [f"Tarif/nuit", f"{booking.get('price_per_night', 0):.2f} $"],
     ]
-    
-    room_table = Table(room_data, colWidths=[5*cm, 6*cm, 4*cm])
+    room_table = Table(room_info, colWidths=[120, 70])
     room_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0F2C25')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-        ('TOPPADDING', (0, 0), (-1, 0), 10),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F9F8F4')),
-        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#D1CEC7')),
-        ('TOPPADDING', (0, 1), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+        ('FONTNAME', (0, 0), (-1, -1), 'Courier'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('TOPPADDING', (0, 0), (-1, -1), 1),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
     ]))
     elements.append(room_table)
     
     room_total = booking.get("total_price", 0)
-    elements.append(Spacer(1, 5))
-    elements.append(Paragraph(f"<b>Sous-total Hébergement: {room_total:.2f} $</b>", ParagraphStyle('RoomTotal', parent=styles['Normal'], alignment=2)))
-    elements.append(Spacer(1, 20))
+    elements.append(Paragraph(f"Sous-total: {room_total:.2f} $", ParagraphStyle('SubTotal', parent=styles['Normal'], fontSize=9, alignment=2)))
+    elements.append(Paragraph("-" * 35, center_style))
     
-    # Restaurant items section
+    # Restaurant items
     restaurant_items = booking.get("restaurant_items", [])
     restaurant_total = booking.get("restaurant_total", 0)
     
     if restaurant_items:
-        elements.append(Paragraph("RESTAURANT & BAR", subtitle_style))
+        elements.append(Paragraph("RESTAURANT & BAR", section_style))
         
-        resto_data = [["Article", "Qté", "Prix Unit.", "Total"]]
+        resto_data = [["Qté", "Article", "Total"]]
         for item in restaurant_items:
             resto_data.append([
-                item.get("name", ""),
                 str(item.get("quantity", 0)),
-                f"{item.get('price', 0):.2f} $",
+                item.get("name", "")[:15],
                 f"{item.get('price', 0) * item.get('quantity', 0):.2f} $"
             ])
         
-        resto_table = Table(resto_data, colWidths=[7*cm, 2*cm, 3*cm, 3*cm])
+        resto_table = Table(resto_data, colWidths=[25, 115, 50])
         resto_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0F2C25')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Courier'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-            ('TOPPADDING', (0, 0), (-1, 0), 10),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F9F8F4')),
-            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#D1CEC7')),
-            ('TOPPADDING', (0, 1), (-1, -1), 6),
-            ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+            ('ALIGN', (0, 0), (0, -1), 'CENTER'),
+            ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
+            ('TOPPADDING', (0, 0), (-1, -1), 2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+            ('LINEBELOW', (0, 0), (-1, 0), 0.5, colors.black),
         ]))
         elements.append(resto_table)
-        elements.append(Spacer(1, 5))
-        elements.append(Paragraph(f"<b>Sous-total Restaurant: {restaurant_total:.2f} $</b>", ParagraphStyle('RestoTotal', parent=styles['Normal'], alignment=2)))
-        elements.append(Spacer(1, 20))
+        elements.append(Paragraph(f"Sous-total: {restaurant_total:.2f} $", ParagraphStyle('SubTotal', parent=styles['Normal'], fontSize=9, alignment=2)))
+        elements.append(Paragraph("-" * 35, center_style))
     
-    # Grand Total (sans TVA)
+    # Grand Total
     subtotal = room_total + restaurant_total
     total = subtotal
     
-    elements.append(Paragraph("RÉCAPITULATIF", subtitle_style))
-    
+    elements.append(Paragraph("=" * 35, center_style))
     total_data = [
         ["Hébergement", f"{room_total:.2f} $"],
-        ["Restaurant & Bar", f"{restaurant_total:.2f} $"],
-        ["Sous-total", f"{subtotal:.2f} $"],
-        ["TOTAL À PAYER", f"{total:.2f} $"],
+        ["Restaurant", f"{restaurant_total:.2f} $"],
     ]
-    total_table = Table(total_data, colWidths=[11*cm, 4*cm])
+    total_table = Table(total_data, colWidths=[120, 70])
     total_table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), 'Courier'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
         ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, -1), (-1, -1), 14),
-        ('TOPPADDING', (0, 0), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-        ('LINEABOVE', (0, -1), (-1, -1), 2, colors.HexColor('#0F2C25')),
-        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#F9F8F4')),
     ]))
     elements.append(total_table)
-    elements.append(Spacer(1, 30))
+    elements.append(Paragraph("=" * 35, center_style))
+    elements.append(Paragraph(f"<b>TOTAL: {total:.2f} $</b>", ParagraphStyle('GrandTotal', parent=styles['Normal'], fontSize=12, fontName='Helvetica-Bold', alignment=1)))
+    elements.append(Paragraph("=" * 35, center_style))
     
     # Footer
-    elements.append(Paragraph("Merci de votre séjour !", ParagraphStyle('Footer', parent=styles['Normal'], alignment=1, fontSize=12)))
-    elements.append(Paragraph("La Villa Delice", ParagraphStyle('Footer2', parent=styles['Normal'], alignment=1, fontSize=10, textColor=colors.gray)))
     elements.append(Spacer(1, 10))
-    elements.append(Paragraph("Q. Les volcans, Avenue Grevaillas, Numero 076 Goma Nord Kivu • Tél: 980629999", ParagraphStyle('Footer3', parent=styles['Normal'], alignment=1, fontSize=8, textColor=colors.gray)))
+    elements.append(Paragraph("Merci de votre séjour !", center_style))
+    elements.append(Paragraph("La Villa Delice", small_style))
     
     doc.build(elements)
     buffer.seek(0)
@@ -1021,6 +1033,19 @@ async def create_order(order_data: OrderCreate):
     doc['items'] = [item.model_dump() for item in order.items]
     doc = serialize_datetime(doc)
     await db.orders.insert_one(doc)
+    
+    # Send push notification for new order
+    try:
+        customer = order_data.customer_name or "Client"
+        table = f" - Table {order_data.table_number}" if order_data.table_number else ""
+        await send_push_notification(
+            title="🔔 Nouvelle commande !",
+            body=f"{customer}{table} - {total:.2f} €",
+            url="/admin/orders"
+        )
+    except Exception as e:
+        logger.error(f"Failed to send push notification: {e}")
+    
     return order
 
 @api_router.put("/orders/{order_id}/status")
@@ -1031,14 +1056,195 @@ async def update_order_status(order_id: str, update: OrderUpdate, current_user: 
     result = await db.orders.update_one({"id": order_id}, {"$set": {"status": update.status}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Send push notification when order is ready
+    if update.status == "ready":
+        try:
+            order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+            if order:
+                customer = order.get("customer_name", "Client")
+                table = f" - Table {order.get('table_number')}" if order.get('table_number') else ""
+                await send_push_notification(
+                    title="🍽️ Commande prête !",
+                    body=f"{customer}{table} est prête à servir",
+                    url="/admin/orders",
+                    exclude_user_id=current_user.id  # Don't notify the cook who marked it ready
+                )
+        except Exception as e:
+            logger.error(f"Failed to send push notification: {e}")
+    
     return {"message": "Status updated"}
 
 @api_router.delete("/orders/{order_id}")
-async def delete_order(order_id: str, admin: User = Depends(get_admin_user)):
+async def delete_order(order_id: str, current_user: User = Depends(get_current_user)):
+    # Instead of hard delete, soft delete with who deleted
+    order = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Log deletion
+    deletion_log = {
+        "id": str(uuid.uuid4()),
+        "order_id": order_id,
+        "order_data": order,
+        "deleted_by": current_user.email,
+        "deleted_by_name": current_user.name,
+        "deleted_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.deletion_logs.insert_one(deletion_log)
+    
+    # Delete the order
     result = await db.orders.delete_one({"id": order_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Order not found")
-    return {"message": "Order deleted"}
+    return {"message": "Order deleted", "deleted_by": current_user.name}
+
+@api_router.get("/orders/deletions/history")
+async def get_deletion_history(current_user: User = Depends(get_admin_user)):
+    """Get history of all deleted orders (admin only)"""
+    deletions = await db.deletion_logs.find({}, {"_id": 0}).sort("deleted_at", -1).to_list(100)
+    return deletions
+
+# ==================== PUSH NOTIFICATIONS ====================
+
+async def send_push_notification(title: str, body: str, url: str = "/admin/orders", exclude_user_id: str = None):
+    """Send push notification to all subscribed users"""
+    query = {} if exclude_user_id is None else {"user_id": {"$ne": exclude_user_id}}
+    subscriptions = await db.push_subscriptions.find(query, {"_id": 0}).to_list(1000)
+    
+    payload = json.dumps({
+        "title": title,
+        "body": body,
+        "icon": "https://customer-assets.emergentagent.com/job_hotel-qr-menu-2/artifacts/99kuvteg_logo%201.png",
+        "badge": "https://customer-assets.emergentagent.com/job_hotel-qr-menu-2/artifacts/99kuvteg_logo%201.png",
+        "url": url,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    
+    failed_subscriptions = []
+    
+    for sub in subscriptions:
+        try:
+            webpush(
+                subscription_info={
+                    "endpoint": sub["endpoint"],
+                    "keys": {
+                        "p256dh": sub["keys"]["p256dh"],
+                        "auth": sub["keys"]["auth"]
+                    }
+                },
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={
+                    "sub": VAPID_EMAIL
+                }
+            )
+            logger.info(f"Push sent to user {sub.get('user_id', 'unknown')}")
+        except WebPushException as e:
+            logger.error(f"Push failed: {e}")
+            # If subscription is expired/invalid, mark for deletion
+            if e.response and e.response.status_code in [404, 410]:
+                failed_subscriptions.append(sub["id"])
+    
+    # Clean up invalid subscriptions
+    if failed_subscriptions:
+        await db.push_subscriptions.delete_many({"id": {"$in": failed_subscriptions}})
+        logger.info(f"Cleaned up {len(failed_subscriptions)} invalid subscriptions")
+    
+    return len(subscriptions) - len(failed_subscriptions)
+
+@api_router.get("/push/vapid-public-key")
+async def get_vapid_public_key():
+    """Get the VAPID public key for push subscription"""
+    return {"publicKey": VAPID_PUBLIC_KEY}
+
+@api_router.post("/push/subscribe")
+async def subscribe_to_push(
+    subscription: PushSubscriptionCreate,
+    current_user: User = Depends(get_current_user)
+):
+    """Subscribe to push notifications"""
+    # Check if this endpoint already exists for this user
+    existing = await db.push_subscriptions.find_one({
+        "user_id": current_user.id,
+        "endpoint": subscription.endpoint
+    })
+    
+    if existing:
+        return {"message": "Already subscribed", "id": existing.get("id")}
+    
+    # Create new subscription
+    sub = PushSubscription(
+        user_id=current_user.id,
+        endpoint=subscription.endpoint,
+        keys=subscription.keys,
+        user_agent=subscription.user_agent
+    )
+    
+    doc = sub.model_dump()
+    doc = serialize_datetime(doc)
+    await db.push_subscriptions.insert_one(doc)
+    
+    logger.info(f"User {current_user.id} subscribed to push notifications")
+    
+    return {"message": "Subscribed successfully", "id": sub.id}
+
+@api_router.delete("/push/unsubscribe")
+async def unsubscribe_from_push(
+    endpoint: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Unsubscribe from push notifications"""
+    result = await db.push_subscriptions.delete_one({
+        "user_id": current_user.id,
+        "endpoint": endpoint
+    })
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    
+    return {"message": "Unsubscribed successfully"}
+
+@api_router.post("/push/test")
+async def test_push_notification(current_user: User = Depends(get_current_user)):
+    """Send a test push notification to the current user"""
+    subscriptions = await db.push_subscriptions.find(
+        {"user_id": current_user.id}, {"_id": 0}
+    ).to_list(10)
+    
+    if not subscriptions:
+        raise HTTPException(status_code=404, detail="No push subscription found. Please enable notifications.")
+    
+    payload = json.dumps({
+        "title": "🔔 Test Notification",
+        "body": "Les notifications push fonctionnent correctement !",
+        "icon": "https://customer-assets.emergentagent.com/job_hotel-qr-menu-2/artifacts/99kuvteg_logo%201.png",
+        "url": "/admin/orders",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    
+    success_count = 0
+    for sub in subscriptions:
+        try:
+            webpush(
+                subscription_info={
+                    "endpoint": sub["endpoint"],
+                    "keys": {
+                        "p256dh": sub["keys"]["p256dh"],
+                        "auth": sub["keys"]["auth"]
+                    }
+                },
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={
+                    "sub": VAPID_EMAIL
+                }
+            )
+            success_count += 1
+        except WebPushException as e:
+            logger.error(f"Test push failed: {e}")
+    
+    return {"message": f"Test notification sent to {success_count} device(s)"}
 
 # ==================== QR CODE ROUTES ====================
 
@@ -1238,97 +1444,72 @@ async def get_invoice(order_id: str):
 
 @api_router.get("/invoices/{order_id}/pdf")
 async def generate_invoice_pdf(order_id: str):
-    """Generate PDF invoice for a specific order"""
+    """Generate PDF invoice for a specific order - Thermal format"""
     order = await db.orders.find_one({"id": order_id}, {"_id": 0})
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
+    # Format ticket thermique 80mm
+    page_width = 226
+    doc = SimpleDocTemplate(buffer, pagesize=(page_width, 600), rightMargin=10, leftMargin=10, topMargin=15, bottomMargin=15)
     elements = []
     
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'InvoiceTitle',
-        parent=styles['Heading1'],
-        fontSize=28,
-        spaceAfter=10,
-        textColor=colors.HexColor('#0F2C25')
-    )
     
-    # Header
-    elements.append(Paragraph("La Villa Delice", title_style))
-    elements.append(Paragraph("Restaurant & Bar", styles['Normal']))
-    elements.append(Spacer(1, 20))
+    # Styles ticket thermique
+    title_style = ParagraphStyle('ThermalTitle', parent=styles['Normal'], fontSize=14, fontName='Helvetica-Bold', alignment=1, spaceAfter=5)
+    center_style = ParagraphStyle('ThermalCenter', parent=styles['Normal'], fontSize=9, alignment=1, spaceAfter=3)
+    small_style = ParagraphStyle('ThermalSmall', parent=styles['Normal'], fontSize=8, alignment=1, spaceAfter=2)
+    section_style = ParagraphStyle('ThermalSection', parent=styles['Normal'], fontSize=10, fontName='Helvetica-Bold', alignment=1, spaceBefore=5, spaceAfter=3)
     
-    # Invoice details
-    invoice_info = [
-        ["FACTURE", f"INV-{order_id[:8].upper()}"],
-        ["Date", datetime.fromisoformat(order.get("created_at", datetime.now(timezone.utc).isoformat())).strftime("%d/%m/%Y %H:%M")],
-        ["Client", order.get("customer_name", "Client")],
-    ]
-    if order.get("room_number"):
-        invoice_info.append(["Chambre", order.get("room_number")])
+    # Header - La Villa Delice
+    elements.append(Paragraph("LA VILLA DELICE", title_style))
+    elements.append(Paragraph("Restaurant & Bar", center_style))
+    elements.append(Paragraph("Q. Les volcans, Avenue Grevaillas", small_style))
+    elements.append(Paragraph("Numero 076 Goma Nord Kivu", small_style))
+    elements.append(Paragraph("Tél: 980629999", small_style))
+    elements.append(Spacer(1, 5))
+    elements.append(Paragraph("-" * 35, center_style))
+    
+    # Invoice info
+    order_date = order.get("created_at", datetime.now(timezone.utc).isoformat())
+    if isinstance(order_date, str):
+        order_date = datetime.fromisoformat(order_date.replace('Z', '+00:00'))
+    
+    elements.append(Paragraph(f"Facture N°: INV-{order_id[:8].upper()}", small_style))
+    elements.append(Paragraph(f"Date: {order_date.strftime('%d/%m/%Y %H:%M')}", small_style))
+    if order.get("customer_name"):
+        elements.append(Paragraph(f"Client: {order.get('customer_name')}", small_style))
     if order.get("table_number"):
-        invoice_info.append(["Table", order.get("table_number")])
+        elements.append(Paragraph(f"Table: {order.get('table_number')}", small_style))
+    if order.get("room_number"):
+        elements.append(Paragraph(f"Chambre: {order.get('room_number')}", small_style))
+    elements.append(Paragraph("-" * 35, center_style))
     
-    info_table = Table(invoice_info, colWidths=[4*cm, 8*cm])
-    info_table.setStyle(TableStyle([
-        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 11),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-    ]))
-    elements.append(info_table)
-    elements.append(Spacer(1, 30))
+    # Items header
+    elements.append(Paragraph("Qté  Article              Total", ParagraphStyle('Header', parent=styles['Normal'], fontSize=8, fontName='Courier-Bold')))
+    elements.append(Paragraph("-" * 35, center_style))
     
-    # Items table
-    items_data = [["Article", "Qté", "Prix Unit.", "Total"]]
+    # Items
     for item in order.get("items", []):
-        items_data.append([
-            item.get("name", ""),
-            str(item.get("quantity", 0)),
-            f"{item.get('price', 0):.2f} $",
-            f"{item.get('price', 0) * item.get('quantity', 0):.2f} $"
-        ])
+        qty = str(item.get("quantity", 0)).ljust(3)
+        name = item.get("name", "")[:18].ljust(18)
+        total = f"{item.get('price', 0) * item.get('quantity', 0):.2f} $"
+        elements.append(Paragraph(f"{qty} {name} {total}", ParagraphStyle('Item', parent=styles['Normal'], fontSize=8, fontName='Courier')))
     
-    items_table = Table(items_data, colWidths=[7*cm, 2*cm, 3*cm, 3*cm])
-    items_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0F2C25')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('TOPPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F9F8F4')),
-        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#D1CEC7')),
-        ('TOPPADDING', (0, 1), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
-    ]))
-    elements.append(items_table)
-    elements.append(Spacer(1, 20))
+    elements.append(Paragraph("-" * 35, center_style))
     
     # Total
-    total_data = [
-        ["Sous-total", f"{order.get('total', 0):.2f} $"],
-        ["Service", "Inclus"],
-        ["TOTAL", f"{order.get('total', 0):.2f} $"],
-    ]
-    total_table = Table(total_data, colWidths=[10*cm, 5*cm])
-    total_table.setStyle(TableStyle([
-        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, -1), (-1, -1), 14),
-        ('TOPPADDING', (0, 0), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-        ('LINEABOVE', (0, -1), (-1, -1), 2, colors.HexColor('#0F2C25')),
-    ]))
-    elements.append(total_table)
-    elements.append(Spacer(1, 40))
+    elements.append(Paragraph(f"Sous-total: {order.get('total', 0):.2f} $", ParagraphStyle('SubTotal', parent=styles['Normal'], fontSize=9, alignment=2)))
+    elements.append(Paragraph("=" * 35, center_style))
+    elements.append(Paragraph(f"<b>TOTAL: {order.get('total', 0):.2f} $</b>", ParagraphStyle('GrandTotal', parent=styles['Normal'], fontSize=12, fontName='Helvetica-Bold', alignment=1)))
+    elements.append(Paragraph("=" * 35, center_style))
     
     # Footer
-    elements.append(Paragraph("Merci de votre visite !", ParagraphStyle('Footer', parent=styles['Normal'], alignment=1, fontSize=12)))
-    elements.append(Paragraph("La Villa Delice", ParagraphStyle('Footer2', parent=styles['Normal'], alignment=1, fontSize=10, textColor=colors.gray)))
+    elements.append(Spacer(1, 10))
+    elements.append(Paragraph("Merci de votre visite !", center_style))
+    elements.append(Paragraph("La Villa Delice", small_style))
     
     doc.build(elements)
     buffer.seek(0)
@@ -1342,94 +1523,111 @@ async def generate_invoice_pdf(order_id: str):
 @api_router.get("/reports/pdf")
 async def generate_report_pdf(period: str = "all", date: str = None, current_user: User = Depends(get_current_user)):
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)
+    # Format ticket thermique 80mm (environ 226 points = 80mm)
+    page_width = 226
+    doc = SimpleDocTemplate(buffer, pagesize=(page_width, 800), rightMargin=10, leftMargin=10, topMargin=15, bottomMargin=15)
     elements = []
     
     styles = getSampleStyleSheet()
+    
+    # Styles ticket thermique
     title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        spaceAfter=30,
-        textColor=colors.HexColor('#0F2C25')
+        'ThermalTitle',
+        parent=styles['Normal'],
+        fontSize=14,
+        fontName='Helvetica-Bold',
+        alignment=1,
+        spaceAfter=5
     )
-    subtitle_style = ParagraphStyle(
-        'CustomSubtitle',
-        parent=styles['Heading2'],
-        fontSize=16,
-        spaceAfter=20,
-        textColor=colors.HexColor('#C5A059')
+    center_style = ParagraphStyle(
+        'ThermalCenter',
+        parent=styles['Normal'],
+        fontSize=9,
+        alignment=1,
+        spaceAfter=3
+    )
+    small_style = ParagraphStyle(
+        'ThermalSmall',
+        parent=styles['Normal'],
+        fontSize=8,
+        alignment=1,
+        spaceAfter=2
+    )
+    section_style = ParagraphStyle(
+        'ThermalSection',
+        parent=styles['Normal'],
+        fontSize=10,
+        fontName='Helvetica-Bold',
+        alignment=1,
+        spaceBefore=10,
+        spaceAfter=5
     )
     
+    # Header - La Villa Delice
+    elements.append(Paragraph("LA VILLA DELICE", title_style))
+    elements.append(Paragraph("Restaurant & Bar", center_style))
+    elements.append(Paragraph("Q. Les volcans, Avenue Grevaillas", small_style))
+    elements.append(Paragraph("Numero 076 Goma Nord Kivu", small_style))
+    elements.append(Paragraph("Tél: 980629999", small_style))
+    elements.append(Spacer(1, 5))
+    elements.append(Paragraph("-" * 35, center_style))
+    
     # Title
-    elements.append(Paragraph("La Villa Delice - Rapport", title_style))
-    elements.append(Paragraph(f"Q. Les volcans, Avenue Grevaillas, Goma Nord Kivu", styles['Normal']))
-    elements.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}", styles['Normal']))
-    elements.append(Spacer(1, 20))
+    elements.append(Paragraph("RAPPORT", section_style))
+    elements.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}", small_style))
+    elements.append(Paragraph("-" * 35, center_style))
     
     # Stats
     stats = await get_stats(current_user)
-    elements.append(Paragraph("Statistiques Générales", subtitle_style))
+    elements.append(Paragraph("STATISTIQUES", section_style))
     
     stats_data = [
-        ["Métrique", "Valeur"],
-        ["Total Commandes", str(stats["total_orders"])],
-        ["Commandes Aujourd'hui", str(stats["today_orders"])],
-        ["Commandes en Attente", str(stats["pending_orders"])],
-        ["Articles au Menu", str(stats["total_menu_items"])],
-        ["Chambres Totales", str(stats["total_rooms"])],
-        ["Chambres Disponibles", str(stats["available_rooms"])],
-        ["Revenu Total", f"{stats['total_revenue']:.2f} $"]
+        ["Commandes totales", str(stats["total_orders"])],
+        ["Commandes aujourd'hui", str(stats["today_orders"])],
+        ["En attente", str(stats["pending_orders"])],
+        ["Articles menu", str(stats["total_menu_items"])],
+        ["Chambres totales", str(stats["total_rooms"])],
+        ["Chambres dispo", str(stats["available_rooms"])],
+        ["Revenu total", f"{stats['total_revenue']:.2f} $"]
     ]
     
-    stats_table = Table(stats_data, colWidths=[10*cm, 5*cm])
+    stats_table = Table(stats_data, colWidths=[100, 80])
     stats_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0F2C25')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F9F8F4')),
-        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#D1CEC7')),
-        ('FONTSIZE', (0, 1), (-1, -1), 10),
-        ('TOPPADDING', (0, 1), (-1, -1), 8),
-        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
+        ('FONTNAME', (0, 0), (-1, -1), 'Courier'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('TOPPADDING', (0, 0), (-1, -1), 2),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
     ]))
     elements.append(stats_table)
-    elements.append(Spacer(1, 30))
+    elements.append(Spacer(1, 5))
+    elements.append(Paragraph("-" * 35, center_style))
     
-    # Recent Orders
-    elements.append(Paragraph("Commandes Récentes", subtitle_style))
-    orders = await db.orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(20)
+    # Recent orders
+    elements.append(Paragraph("COMMANDES RÉCENTES", section_style))
+    
+    orders = await db.orders.find().sort("created_at", -1).limit(10).to_list(10)
     
     if orders:
-        orders_data = [["ID", "Client", "Total", "Statut", "Date"]]
         for order in orders:
-            order_id = order.get("id", "")[:8]
-            customer = order.get("customer_name", "Anonyme") or "Anonyme"
+            order_date = order.get('created_at', datetime.now())
+            if isinstance(order_date, str):
+                order_date = datetime.fromisoformat(order_date.replace('Z', '+00:00'))
+            date_str = order_date.strftime('%d/%m %H:%M')
             total = f"{order.get('total', 0):.2f} $"
-            status = order.get("status", "pending")
-            date = order.get("created_at", "")[:10] if order.get("created_at") else ""
-            orders_data.append([order_id, customer[:20], total, status, date])
-        
-        orders_table = Table(orders_data, colWidths=[2.5*cm, 4*cm, 3*cm, 3*cm, 3*cm])
-        orders_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#0F2C25')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F9F8F4')),
-            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#D1CEC7')),
-            ('FONTSIZE', (0, 1), (-1, -1), 9),
-            ('TOPPADDING', (0, 1), (-1, -1), 6),
-            ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
-        ]))
-        elements.append(orders_table)
+            status = order.get('status', 'pending')[:3].upper()
+            
+            elements.append(Paragraph(f"{date_str} | {status} | {total}", small_style))
     else:
-        elements.append(Paragraph("Aucune commande", styles['Normal']))
+        elements.append(Paragraph("Aucune commande", small_style))
+    
+    elements.append(Spacer(1, 5))
+    elements.append(Paragraph("=" * 35, center_style))
+    
+    # Footer
+    elements.append(Paragraph("Merci !", center_style))
+    elements.append(Paragraph("La Villa Delice", small_style))
     
     doc.build(elements)
     buffer.seek(0)
@@ -1437,7 +1635,7 @@ async def generate_report_pdf(period: str = "all", date: str = None, current_use
     return StreamingResponse(
         buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": "attachment; filename=rapport_hotel.pdf"}
+        headers={"Content-Disposition": "attachment; filename=rapport_villa_delice.pdf"}
     )
 
 # ==================== SEED DATA ====================
