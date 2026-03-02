@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
@@ -9,7 +9,7 @@ import logging
 import json
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timezone, timedelta
 from jose import JWTError, jwt
@@ -24,14 +24,26 @@ from reportlab.lib.units import cm
 import base64
 from pywebpush import webpush, WebPushException
 from py_vapid import Vapid
+from bson import ObjectId
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+DB_AVAILABLE = True
+client = None
+db = None
+try:
+    client = AsyncIOMotorClient(mongo_url)
+    # Attempt a quick server_info() to trigger DNS/connection issues at startup
+    # This is synchronous but will raise quickly if DNS fails for SRV
+    client.server_info()
+    db = client[os.environ['DB_NAME']]
+except Exception as e:
+    DB_AVAILABLE = False
+    logger.error('Failed to initialize MongoDB client at startup: %s', e)
+    db = None
 
 # JWT Configuration
 SECRET_KEY = os.environ.get('JWT_SECRET', 'hotel-secret-key-change-in-production')
@@ -78,6 +90,12 @@ security = HTTPBearer()
 # Create the main app
 app = FastAPI(title="Hotel Restaurant API")
 
+# In-memory mapping of user_id -> list of websocket connections and metadata
+# Each entry: {"ws": WebSocket, "endpoint": Optional[str]}
+user_ws: Dict[str, List[dict]] = {}
+# Parse allowed origins from environment for debugging / WebSocket checks
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('CORS_ORIGINS', '*').split(',') if o.strip()]
+
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
@@ -87,6 +105,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logger.info(f"Allowed CORS origins: {ALLOWED_ORIGINS}")
 
 # ==================== MODELS ====================
 
@@ -96,6 +115,7 @@ class UserRole:
     GUEST = "guest"
     SERVEUR = "serveur"
     CUISINIER = "cuisinier"
+    MAGAZINIER = "magazinier"
 
 class UserBase(BaseModel):
     email: str
@@ -261,6 +281,7 @@ class DirectInvoice(BaseModel):
     payment_method: str = "cash"  # cash, card, room_charge
     room_number: Optional[str] = ""
     notes: Optional[str] = ""
+    # credit fields removed
     status: str = "paid"  # paid, pending, cancelled
     created_by: Optional[str] = ""  # Who created this invoice
     created_by_name: Optional[str] = ""  # Name of the creator
@@ -274,6 +295,7 @@ class DirectInvoiceCreate(BaseModel):
     payment_method: str = "cash"
     room_number: Optional[str] = ""
     notes: Optional[str] = ""
+    # credit fields removed
 
 # Push Notification Models
 class PushSubscriptionKeys(BaseModel):
@@ -293,6 +315,37 @@ class PushSubscriptionCreate(BaseModel):
     endpoint: str
     keys: PushSubscriptionKeys
     user_agent: Optional[str] = ""
+
+
+class UnsubscribeOthersRequest(BaseModel):
+    exclude_endpoint: Optional[str] = None
+
+
+# Credit Models
+class Credit(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    invoice_id: Optional[str] = None
+    customer_name: str
+    customer_phone: Optional[str] = ""
+    customer_email: Optional[str] = ""
+    amount_due: float = 0.0
+    balance: float = 0.0
+    status: str = "open"  # open, paid
+    notes: Optional[str] = ""
+    created_by: Optional[str] = ""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    items: List[OrderItem] = Field(default_factory=list)
+
+
+class CreditCreate(BaseModel):
+    invoice_id: Optional[str] = None
+    customer_name: str
+    customer_phone: Optional[str] = ""
+    customer_email: Optional[str] = ""
+    amount: float = 0.0
+    notes: Optional[str] = ""
+    items: List[OrderItem] = Field(default_factory=list)
 
 # ==================== HELPER FUNCTIONS ====================
 
@@ -336,6 +389,18 @@ async def get_admin_user(current_user: User = Depends(get_current_user)) -> User
             detail="Admin access required"
         )
     return current_user
+
+
+def require_roles(*allowed_roles):
+    """Dependency factory that ensures the current user has one of the allowed roles."""
+    async def _dep(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: insufficient role"
+            )
+        return current_user
+    return _dep
 
 def serialize_datetime(doc: dict) -> dict:
     """Convert datetime objects to ISO strings for JSON serialization"""
@@ -410,7 +475,7 @@ async def delete_user(user_id: str, admin: User = Depends(get_admin_user)):
 
 @api_router.put("/users/{user_id}/role")
 async def update_user_role(user_id: str, role: str, admin: User = Depends(get_admin_user)):
-    if role not in [UserRole.ADMIN, UserRole.STAFF, UserRole.GUEST]:
+    if role not in [UserRole.ADMIN, UserRole.STAFF, UserRole.GUEST, UserRole.SERVEUR, UserRole.CUISINIER, UserRole.MAGAZINIER]:
         raise HTTPException(status_code=400, detail="Invalid role")
     result = await db.users.update_one({"id": user_id}, {"$set": {"role": role}})
     if result.matched_count == 0:
@@ -463,7 +528,7 @@ async def get_menu_item(item_id: str):
     return MenuItem(**deserialize_datetime(item))
 
 @api_router.post("/menu", response_model=MenuItem)
-async def create_menu_item(item_data: MenuItemCreate, admin: User = Depends(get_admin_user)):
+async def create_menu_item(item_data: MenuItemCreate, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF))):
     item = MenuItem(**item_data.model_dump())
     doc = item.model_dump()
     doc = serialize_datetime(doc)
@@ -471,7 +536,7 @@ async def create_menu_item(item_data: MenuItemCreate, admin: User = Depends(get_
     return item
 
 @api_router.put("/menu/{item_id}", response_model=MenuItem)
-async def update_menu_item(item_id: str, item_data: MenuItemCreate, admin: User = Depends(get_admin_user)):
+async def update_menu_item(item_id: str, item_data: MenuItemCreate, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF))):
     update_data = item_data.model_dump()
     result = await db.menu_items.update_one({"id": item_id}, {"$set": update_data})
     if result.matched_count == 0:
@@ -488,7 +553,7 @@ async def delete_menu_item(item_id: str, admin: User = Depends(get_admin_user)):
 
 # Stock Management
 @api_router.put("/menu/{item_id}/stock")
-async def update_stock(item_id: str, quantity: int, admin: User = Depends(get_admin_user)):
+async def update_stock(item_id: str, quantity: int, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF))):
     """Update stock quantity for a menu item"""
     result = await db.menu_items.update_one(
         {"id": item_id}, 
@@ -499,7 +564,7 @@ async def update_stock(item_id: str, quantity: int, admin: User = Depends(get_ad
     return {"message": "Stock updated", "quantity": quantity}
 
 @api_router.post("/menu/{item_id}/stock/add")
-async def add_stock(item_id: str, quantity: int, admin: User = Depends(get_admin_user)):
+async def add_stock(item_id: str, quantity: int, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF))):
     """Add stock to a menu item"""
     item = await db.menu_items.find_one({"id": item_id}, {"_id": 0})
     if not item:
@@ -517,22 +582,147 @@ async def add_stock(item_id: str, quantity: int, admin: User = Depends(get_admin
 # ==================== DIRECT INVOICES ====================
 
 @api_router.get("/invoices")
-async def get_all_invoices(current_user: User = Depends(get_current_user)):
-    """Get all direct invoices"""
+async def get_all_invoices(current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.SERVEUR))):
+    """Get all direct invoices (admin/staff/serveur only)."""
     invoices = await db.direct_invoices.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return [deserialize_datetime(i) for i in invoices]
 
-@api_router.post("/invoices/create")
-async def create_direct_invoice(invoice_data: DirectInvoiceCreate, current_user: User = Depends(get_current_user)):
-    """Create a direct invoice (for restaurant billing)"""
-    # Calculate totals
+@api_router.get("/invoices/history/pdf")
+async def export_invoices_pdf(
+    agent: Optional[str] = None,
+    payment: Optional[str] = None,
+    start: Optional[str] = None,  # YYYY-MM-DD
+    end: Optional[str] = None,    # YYYY-MM-DD
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.SERVEUR))
+):
+    """Export filtered invoices history to a compact PDF list."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    query: dict = {}
+    if agent:
+        query["$or"] = [{"created_by_name": agent}, {"created_by": agent}]
+    if payment and payment != "all":
+        query["payment_method"] = payment
+    # Date filter (inclusive)
+    if start or end:
+        date_filter: dict = {}
+        if start:
+            try:
+                s = datetime.fromisoformat(start).date()
+                date_filter["$gte"] = datetime(s.year, s.month, s.day, 0, 0, 0, tzinfo=timezone.utc).isoformat()
+            except Exception:
+                pass
+        if end:
+            try:
+                e = datetime.fromisoformat(end).date()
+                date_filter["$lte"] = datetime(e.year, e.month, e.day, 23, 59, 59, tzinfo=timezone.utc).isoformat()
+            except Exception:
+                pass
+        if date_filter:
+            query["created_at"] = date_filter
+
+    cursor = db.direct_invoices.find(query, {"_id": 0}).sort("created_at", -1).limit(2000)
+    invoices = await cursor.to_list(length=2000)
+
+    buffer = BytesIO()
+    # Ticket-like width
+    page_width = 300
+    doc = SimpleDocTemplate(buffer, pagesize=(page_width, 900), rightMargin=10, leftMargin=10, topMargin=15, bottomMargin=15)
+    elements = []
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('Title', parent=styles['Normal'], fontSize=14, fontName='Helvetica-Bold', alignment=1, spaceAfter=8)
+    small = ParagraphStyle('Small', parent=styles['Normal'], fontSize=8, alignment=1, spaceAfter=2)
+
+    elements.append(Paragraph("Historique des Factures", title_style))
+    sub = []
+    if agent: sub.append(f"Facturé par: {agent}")
+    if payment and payment != "all": sub.append(f"Paiement: {payment}")
+    if start or end: sub.append(f"Période: {start or '...'} → {end or '...'}")
+    if sub:
+        elements.append(Paragraph(" | ".join(sub), small))
+    elements.append(Spacer(1, 4))
+
+    data = [["N°", "Client", "Agent", "Date", "Pay.", "Total"]]
+    for inv in invoices:
+        num = inv.get("invoice_number", "")
+        client = (inv.get("customer_name") or "")[:14]
+        agent_name = inv.get("created_by_name") or inv.get("created_by") or ""
+        date_str = inv.get("created_at")
+        try:
+            dt = datetime.fromisoformat(date_str.replace('Z', '+00:00')) if isinstance(date_str, str) else date_str
+            date_fmt = dt.strftime("%d/%m")
+        except Exception:
+            date_fmt = ""
+        pay = inv.get("payment_method", "")
+        total = f"{float(inv.get('total', 0)):.2f}"
+        data.append([num, client, agent_name[:10], date_fmt, pay[:6], total])
+
+    table = Table(data, colWidths=[60, 70, 60, 40, 35, 35])
+    table.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 7),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('ALIGN', (3, 0), (-1, -1), 'CENTER'),
+        ('ALIGN', (5, 1), (5, -1), 'RIGHT'),
+        ('LINEBELOW', (0, 0), (-1, 0), 0.5, colors.black),
+        ('TOPPADDING', (0, 0), (-1, -1), 2),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+    ]))
+    elements.append(table)
+
+    doc.build(elements)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=invoices_history.pdf"}
+    )
+
+@api_router.post("/invoices/create-debug")
+async def create_direct_invoice_debug(invoice_data: DirectInvoiceCreate, current_user: User = Depends(get_current_user)):
+    """Debug-only endpoint: build invoice payload without persisting to DB.
+
+    Useful to determine if serialization issues come from the prepared document
+    or from database insertion side-effects.
+    """
     subtotal = sum(item.price * item.quantity for item in invoice_data.items)
-    total = subtotal  # Sans TVA
-    
-    # Generate invoice number
+    total = subtotal
+
     count = await db.direct_invoices.count_documents({})
     invoice_number = f"FACT-{count + 1:06d}"
-    
+
+    items_with_stock = []
+    for item in invoice_data.items:
+        menu_item = await db.menu_items.find_one({"id": item.menu_item_id}, {"_id": 0})
+        stock_before = None
+        stock_after = None
+        if menu_item and menu_item.get("track_stock"):
+            stock_before = menu_item.get("stock_quantity", 0) or 0
+            stock_after = max(0, stock_before - item.quantity)
+
+        if hasattr(item, 'model_dump'):
+            item_dict = item.model_dump()
+        elif isinstance(item, dict):
+            item_dict = item.copy()
+        else:
+            try:
+                item_dict = dict(item)
+            except Exception:
+                item_dict = {
+                    'menu_item_id': getattr(item, 'menu_item_id', None),
+                    'name': getattr(item, 'name', None),
+                    'price': getattr(item, 'price', None),
+                    'quantity': getattr(item, 'quantity', None)
+                }
+
+        item_dict["stock_before"] = stock_before
+        item_dict["stock_after"] = stock_after
+        item_dict["unit_price"] = item.price
+        item_dict["total_price"] = round(item.price * item.quantity, 2)
+        items_with_stock.append(item_dict)
+
     invoice = DirectInvoice(
         invoice_number=invoice_number,
         customer_name=invoice_data.customer_name,
@@ -548,35 +738,395 @@ async def create_direct_invoice(invoice_data: DirectInvoiceCreate, current_user:
         created_by=current_user.email,
         created_by_name=current_user.name
     )
-    
-    # Deduct stock for tracked items
-    for item in invoice_data.items:
-        menu_item = await db.menu_items.find_one({"id": item.menu_item_id}, {"_id": 0})
-        if menu_item and menu_item.get("track_stock"):
-            current_stock = menu_item.get("stock_quantity", 0) or 0
-            new_stock = max(0, current_stock - item.quantity)
-            await db.menu_items.update_one(
-                {"id": item.menu_item_id},
-                {"$set": {"stock_quantity": new_stock}}
-            )
-    
+
     doc = invoice.model_dump()
-    doc['items'] = [item.model_dump() for item in invoice.items]
+    doc['items'] = items_with_stock
     doc = serialize_datetime(doc)
-    await db.direct_invoices.insert_one(doc)
-    
-    return invoice
+    # Sanitize BSON types before returning
+    return sanitize_bson(doc)
+
+@api_router.post("/invoices/create")
+async def create_direct_invoice(invoice_data: DirectInvoiceCreate, current_user: User = Depends(get_current_user)):
+    """Create a direct invoice (for restaurant billing)"""
+    logger.info('create_direct_invoice called by %s with %d items', getattr(current_user, 'email', 'anonymous'), len(getattr(invoice_data, 'items', [])))
+    try:
+        # Calculate totals
+        subtotal = sum(item.price * item.quantity for item in invoice_data.items)
+        total = subtotal  # Sans TVA
+
+        # Generate invoice number
+        count = await db.direct_invoices.count_documents({})
+        invoice_number = f"FACT-{count + 1:06d}"
+
+        # Build enriched items list including stock before/after and price totals
+        items_with_stock = []
+        for item in invoice_data.items:
+            menu_item = await db.menu_items.find_one({"id": item.menu_item_id}, {"_id": 0})
+            stock_before = None
+            stock_after = None
+            if menu_item and menu_item.get("track_stock"):
+                stock_before = menu_item.get("stock_quantity", 0) or 0
+                stock_after = max(0, stock_before - item.quantity)
+                await db.menu_items.update_one(
+                    {"id": item.menu_item_id},
+                    {"$set": {"stock_quantity": stock_after}}
+                )
+
+            # Support both pydantic models and plain dicts
+            if hasattr(item, 'model_dump'):
+                item_dict = item.model_dump()
+            elif isinstance(item, dict):
+                item_dict = item.copy()
+            else:
+                try:
+                    item_dict = dict(item)
+                except Exception:
+                    item_dict = {
+                        'menu_item_id': getattr(item, 'menu_item_id', None),
+                        'name': getattr(item, 'name', None),
+                        'price': getattr(item, 'price', None),
+                        'quantity': getattr(item, 'quantity', None)
+                    }
+            item_dict["stock_before"] = stock_before
+            item_dict["stock_after"] = stock_after
+            item_dict["unit_price"] = item.price
+            item_dict["total_price"] = round(item.price * item.quantity, 2)
+            items_with_stock.append(item_dict)
+
+        invoice = DirectInvoice(
+            invoice_number=invoice_number,
+            customer_name=invoice_data.customer_name,
+            customer_email=invoice_data.customer_email,
+            customer_phone=invoice_data.customer_phone,
+            items=invoice_data.items,
+            subtotal=subtotal,
+            tax=0,
+            total=total,
+            payment_method=invoice_data.payment_method,
+            room_number=invoice_data.room_number,
+            notes=invoice_data.notes,
+            created_by=current_user.email,
+            created_by_name=current_user.name
+        )
+
+        doc = invoice.model_dump()
+        # Store enriched items in DB (with stock_before/stock_after and price totals)
+        doc['items'] = items_with_stock
+        doc = serialize_datetime(doc)
+        # Debug: log types inside doc to catch non-serializable values
+        try:
+            logger.info('Invoice doc keys/types: %s', {k: type(v).__name__ for k, v in doc.items()})
+            for idx, it in enumerate(doc.get('items', [])):
+                logger.info('Item %s types: %s', idx, {k: type(v).__name__ for k, v in (it.items() if isinstance(it, dict) else [])})
+        except Exception:
+            logger.exception('Failed to log doc types')
+
+        await db.direct_invoices.insert_one(doc)
+
+        # If this invoice was created on credit, add a credit record for tracking
+        try:
+            if (doc.get('payment_method') or '') == 'credit':
+                credit_doc = {
+                    'id': str(uuid.uuid4()),
+                    'invoice_id': doc.get('id'),
+                    'invoice_number': doc.get('invoice_number'),
+                    'customer_name': doc.get('customer_name'),
+                    'customer_phone': doc.get('customer_phone'),
+                    'customer_email': doc.get('customer_email'),
+                    'created_by_name': doc.get('created_by_name'),
+                    'subtotal': doc.get('subtotal', doc.get('total', 0)),
+                    'amount_due': doc.get('total', 0),
+                    'balance': doc.get('total', 0),
+                    'items': doc.get('items', []),
+                    'created_at': datetime.now(timezone.utc).isoformat(),
+                    'created_by': doc.get('created_by'),
+                }
+                await db.credits.insert_one(serialize_datetime(credit_doc))
+        except Exception:
+            logger.exception('Failed to create credit record for invoice %s', doc.get('id'))
+
+        # Return stored document (with enriched items)
+        stored = deserialize_datetime(doc)
+        stored = sanitize_bson(stored)
+        logger.info('Returning sanitized invoice: %s', repr(stored)[:1000])
+        return stored
+    except Exception as e:
+        # Log full exception for local debugging
+        logger.exception('Error creating direct invoice')
+        print('EXCEPTION in create_direct_invoice:', e)
+        import traceback
+        traceback.print_exc()
+        # In dev return error detail to client to aid debugging
+        detail = str(e)
+        raise HTTPException(status_code=500, detail=detail)
+
+def sanitize_bson(obj):
+    """Recursively convert BSON ObjectId to str so JSON serialization succeeds."""
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: sanitize_bson(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_bson(v) for v in obj]
+    return obj
 
 @api_router.get("/invoices/direct/{invoice_id}")
-async def get_direct_invoice(invoice_id: str):
-    """Get a direct invoice by ID"""
+async def get_direct_invoice(invoice_id: str, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.SERVEUR))):
+    """Get a direct invoice by ID (admin/staff/serveur only)."""
     invoice = await db.direct_invoices.find_one({"id": invoice_id}, {"_id": 0})
     if not invoice:
         raise HTTPException(status_code=404, detail="Invoice not found")
     return deserialize_datetime(invoice)
 
+
+@api_router.post("/invoices/{invoice_id}/pay")
+async def pay_invoice(invoice_id: str, current_user: User = Depends(get_current_user)):
+    """Mark an invoice as paid."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    invoice = await db.direct_invoices.find_one({"id": invoice_id})
+    if not invoice:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    # Update status
+    update = {
+        "$set": {"status": "paid", "paid_by": current_user.email, "paid_at": datetime.now(timezone.utc).isoformat()}
+    }
+    await db.direct_invoices.update_one({"id": invoice_id}, update)
+
+    updated = await db.direct_invoices.find_one({"id": invoice_id}, {"_id": 0})
+    # credit tracking removed
+    return sanitize_bson(deserialize_datetime(updated))
+
+
+@api_router.get("/products/{menu_item_id}/stock-history")
+async def get_product_stock_history(
+    menu_item_id: str,
+    page: int = 1,
+    per_page: int = 20,
+    current_user: User = Depends(get_current_user)
+):
+    """Return stock evolution for a given product/menu item with pagination.
+
+    - `page`: 1-based page number
+    - `per_page`: items per page (capped at 100)
+
+    Results are sorted from most recent to oldest (newest first).
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    if page < 1:
+        page = 1
+    per_page = max(1, min(per_page, 100))
+
+    query = {"items.menu_item_id": menu_item_id}
+    total = await db.direct_invoices.count_documents(query)
+
+    skip = (page - 1) * per_page
+    cursor = db.direct_invoices.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(per_page)
+    invoices = await cursor.to_list(length=per_page)
+
+    events = []
+    for inv in invoices:
+        created = inv.get("created_at")
+        inv_id = inv.get("id")
+        inv_number = inv.get("invoice_number")
+        customer = inv.get("customer_name")
+        for item in inv.get("items", []):
+            if item.get("menu_item_id") == menu_item_id:
+                events.append({
+                    "created_at": created,
+                    "invoice_id": inv_id,
+                    "invoice_number": inv_number,
+                    "customer": customer,
+                    "quantity": item.get("quantity"),
+                    "stock_before": item.get("stock_before"),
+                    "stock_after": item.get("stock_after"),
+                    "unit_price": item.get("unit_price") or item.get("price"),
+                    "total_price": item.get("total_price") or round((item.get("price", 0) * item.get("quantity", 0)), 2),
+                })
+
+    # Ensure events are sorted from most recent to oldest
+    def _parse_dt(v):
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v)
+            except Exception:
+                return datetime.min
+        return datetime.min
+
+    events.sort(key=lambda e: _parse_dt(e.get("created_at", "")), reverse=True)
+
+    return {
+        "events": events,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+    }
+
+
+@api_router.get("/credits")
+async def list_credits(status: Optional[str] = None, admin: User = Depends(get_admin_user)):
+    """List all credits (admin only)."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    query = {}
+    if status:
+        query["status"] = status
+    credits = await db.credits.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return [deserialize_datetime(c) for c in credits]
+
+
+@api_router.post("/credits")
+async def create_credit(payload: CreditCreate, current_user: User = Depends(get_current_user)):
+    """Create a credit record (can be used by staff/admin)."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    # Compute amount from items if not provided
+    computed_total = 0.0
+    try:
+        computed_total = sum((i.price * i.quantity) for i in payload.items) if payload.items else 0.0
+    except Exception:
+        computed_total = 0.0
+    final_amount = payload.amount or computed_total
+
+    credit = Credit(
+        invoice_id=payload.invoice_id,
+        customer_name=payload.customer_name,
+        customer_phone=payload.customer_phone,
+        customer_email=payload.customer_email,
+        amount_due=final_amount,
+        balance=final_amount,
+        notes=payload.notes,
+        created_by=current_user.email,
+        items=payload.items
+    )
+    doc = credit.model_dump()
+    doc = serialize_datetime(doc)
+    await db.credits.insert_one(doc)
+    stored = deserialize_datetime(doc)
+    return sanitize_bson(stored)
+
+
+@api_router.post("/credits/{credit_id}/pay")
+async def pay_credit(credit_id: str, current_user: User = Depends(get_current_user)):
+    """Mark a credit as paid. Also mark linked invoice paid if present."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    credit = await db.credits.find_one({"id": credit_id})
+    if not credit:
+        raise HTTPException(status_code=404, detail="Credit not found")
+
+    update = {
+        "$set": {"status": "paid", "balance": 0, "paid_by": current_user.email, "paid_at": datetime.now(timezone.utc).isoformat()}
+    }
+    await db.credits.update_one({"id": credit_id}, update)
+
+    # If linked to an invoice, mark invoice paid as well
+    try:
+        inv_id = credit.get('invoice_id')
+        if inv_id:
+            await db.direct_invoices.update_one({"id": inv_id}, {"$set": {"status": "paid", "paid_by": current_user.email, "paid_at": datetime.now(timezone.utc).isoformat()}})
+    except Exception:
+        logger.exception('Failed to update linked invoice for credit %s', credit_id)
+
+    updated = await db.credits.find_one({"id": credit_id}, {"_id": 0})
+    return sanitize_bson(deserialize_datetime(updated))
+
+@api_router.get("/credits/{credit_id}/pdf")
+async def generate_credit_pdf(credit_id: str, current_user: User = Depends(get_current_user)):
+    credit = await db.credits.find_one({"id": credit_id}, {"_id": 0})
+    if not credit:
+        raise HTTPException(status_code=404, detail="Credit not found")
+
+    buffer = BytesIO()
+    page_width = 226
+    doc = SimpleDocTemplate(buffer, pagesize=(page_width, 900), rightMargin=10, leftMargin=10, topMargin=15, bottomMargin=15)
+    elements = []
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('ThermalTitle', parent=styles['Normal'], fontSize=14, fontName='Helvetica-Bold', alignment=1, spaceAfter=5)
+    center_style = ParagraphStyle('ThermalCenter', parent=styles['Normal'], fontSize=9, alignment=1, spaceAfter=3)
+    small_style = ParagraphStyle('ThermalSmall', parent=styles['Normal'], fontSize=8, alignment=1, spaceAfter=2)
+    section_style = ParagraphStyle('ThermalSection', parent=styles['Normal'], fontSize=10, fontName='Helvetica-Bold', alignment=1, spaceBefore=5, spaceAfter=3)
+
+    elements.append(Paragraph("LA VILLA DELICE", title_style))
+    elements.append(Paragraph("Restaurant & Bar", center_style))
+    elements.append(Paragraph("Q. Les volcans, Avenue Grevaillas", small_style))
+    elements.append(Paragraph("Numero 076 Goma Nord Kivu", small_style))
+    elements.append(Paragraph("Tél: 980629999", small_style))
+    elements.append(Spacer(1, 5))
+    elements.append(Paragraph("-" * 35, center_style))
+
+    elements.append(Paragraph("CRÉDIT CLIENT", section_style))
+    inv_number = credit.get("invoice_number") or credit.get("invoice_id", "")[:8].upper() if credit.get("invoice_id") else ""
+    if inv_number:
+        elements.append(Paragraph(f"N°: {inv_number}", small_style))
+    created_at = credit.get("created_at", datetime.now(timezone.utc).isoformat())
+    try:
+        created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00')) if isinstance(created_at, str) else created_at
+    except Exception:
+        created_dt = datetime.now(timezone.utc)
+    elements.append(Paragraph(f"Date: {created_dt.strftime('%d/%m/%Y %H:%M')}", small_style))
+    if credit.get("customer_name"):
+        elements.append(Paragraph(f"Client: {credit.get('customer_name')}", small_style))
+    if credit.get("created_by_name") or credit.get("created_by"):
+        elements.append(Paragraph(f"Facturé par: {credit.get('created_by_name') or credit.get('created_by')}", small_style))
+    elements.append(Paragraph("-" * 35, center_style))
+
+    items = credit.get("items", [])
+    if items:
+        data = [["Qté", "Article", "Total"]]
+        subtotal = 0.0
+        for item in items:
+            qty = int(item.get("quantity", 0))
+            name = str(item.get("name", ""))[:15]
+            price = float(item.get("price", 0))
+            line_total = qty * price
+            subtotal += line_total
+            data.append([str(qty), name, f"{line_total:.2f} $"])
+        table = Table(data, colWidths=[25, 115, 50])
+        table.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (-1, -1), 'Courier'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('ALIGN', (0, 0), (0, -1), 'CENTER'),
+            ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
+            ('TOPPADDING', (0, 0), (-1, -1), 2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+            ('LINEBELOW', (0, 0), (-1, 0), 0.5, colors.black),
+        ]))
+        elements.append(table)
+        elements.append(Paragraph("-" * 35, center_style))
+        elements.append(Paragraph(f"Sous-total: {subtotal:.2f} $", ParagraphStyle('SubTotal', parent=styles['Normal'], fontSize=9, alignment=2)))
+
+    total = float(credit.get("amount_due", 0))
+    elements.append(Paragraph("=" * 35, center_style))
+    elements.append(Paragraph(f"<b>TOTAL: {total:.2f} $</b>", ParagraphStyle('GrandTotal', parent=styles['Normal'], fontSize=12, fontName='Helvetica-Bold', alignment=1)))
+    elements.append(Paragraph("=" * 35, center_style))
+
+    status = credit.get("status", "open")
+    elements.append(Paragraph(f"Statut: {status.upper()}", small_style))
+
+    elements.append(Spacer(1, 10))
+    elements.append(Paragraph("Merci de votre visite !", center_style))
+    elements.append(Paragraph("La Villa Delice", small_style))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=credit_{credit_id[:8]}.pdf"}
+    )
 @api_router.get("/invoices/direct/{invoice_id}/pdf")
-async def generate_direct_invoice_pdf(invoice_id: str):
+async def generate_direct_invoice_pdf(invoice_id: str, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.SERVEUR))):
     """Generate thermal receipt PDF for a direct invoice (80mm width)"""
     invoice = await db.direct_invoices.find_one({"id": invoice_id}, {"_id": 0})
     if not invoice:
@@ -709,7 +1259,7 @@ async def delete_room(room_id: str, admin: User = Depends(get_admin_user)):
 # ==================== ROOM BOOKING ROUTES ====================
 
 @api_router.get("/bookings", response_model=List[RoomBooking])
-async def get_bookings(current_user: User = Depends(get_current_user)):
+async def get_bookings(current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.SERVEUR))):
     bookings = await db.bookings.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return [deserialize_datetime(b) for b in bookings]
 
@@ -755,7 +1305,7 @@ async def create_booking(booking_data: RoomBookingCreate, current_user: User = D
     return booking
 
 @api_router.put("/bookings/{booking_id}/status")
-async def update_booking_status(booking_id: str, status: str, current_user: User = Depends(get_current_user)):
+async def update_booking_status(booking_id: str, status: str, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.SERVEUR))):
     valid_statuses = ["confirmed", "checked_in", "checked_out", "cancelled"]
     if status not in valid_statuses:
         raise HTTPException(status_code=400, detail="Invalid status")
@@ -1014,7 +1564,7 @@ async def generate_booking_invoice_pdf(booking_id: str):
 # ==================== ORDER ROUTES ====================
 
 @api_router.get("/orders", response_model=List[Order])
-async def get_orders(current_user: User = Depends(get_current_user)):
+async def get_orders(current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.SERVEUR, UserRole.CUISINIER))):
     orders = await db.orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
     return [deserialize_datetime(o) for o in orders]
 
@@ -1040,7 +1590,7 @@ async def create_order(order_data: OrderCreate):
         table = f" - Table {order_data.table_number}" if order_data.table_number else ""
         await send_push_notification(
             title="🔔 Nouvelle commande !",
-            body=f"{customer}{table} - {total:.2f} €",
+            body=f"{customer}{table} - {total:.2f} $",
             url="/admin/orders"
         )
     except Exception as e:
@@ -1049,7 +1599,7 @@ async def create_order(order_data: OrderCreate):
     return order
 
 @api_router.put("/orders/{order_id}/status")
-async def update_order_status(order_id: str, update: OrderUpdate, current_user: User = Depends(get_current_user)):
+async def update_order_status(order_id: str, update: OrderUpdate, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.SERVEUR))):
     valid_statuses = ["pending", "preparing", "ready", "delivered", "cancelled"]
     if update.status not in valid_statuses:
         raise HTTPException(status_code=400, detail="Invalid status")
@@ -1076,7 +1626,7 @@ async def update_order_status(order_id: str, update: OrderUpdate, current_user: 
     return {"message": "Status updated"}
 
 @api_router.delete("/orders/{order_id}")
-async def delete_order(order_id: str, current_user: User = Depends(get_current_user)):
+async def delete_order(order_id: str, admin: User = Depends(get_admin_user)):
     # Instead of hard delete, soft delete with who deleted
     order = await db.orders.find_one({"id": order_id}, {"_id": 0})
     if not order:
@@ -1087,8 +1637,8 @@ async def delete_order(order_id: str, current_user: User = Depends(get_current_u
         "id": str(uuid.uuid4()),
         "order_id": order_id,
         "order_data": order,
-        "deleted_by": current_user.email,
-        "deleted_by_name": current_user.name,
+        "deleted_by": admin.email,
+        "deleted_by_name": admin.name,
         "deleted_at": datetime.now(timezone.utc).isoformat()
     }
     await db.deletion_logs.insert_one(deletion_log)
@@ -1097,7 +1647,7 @@ async def delete_order(order_id: str, current_user: User = Depends(get_current_u
     result = await db.orders.delete_one({"id": order_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Order not found")
-    return {"message": "Order deleted", "deleted_by": current_user.name}
+    return {"message": "Order deleted", "deleted_by": admin.name}
 
 @api_router.get("/orders/deletions/history")
 async def get_deletion_history(current_user: User = Depends(get_admin_user)):
@@ -1204,6 +1754,84 @@ async def unsubscribe_from_push(
         raise HTTPException(status_code=404, detail="Subscription not found")
     
     return {"message": "Unsubscribed successfully"}
+
+
+@api_router.post("/push/unsubscribe/others")
+async def unsubscribe_other_devices(req: UnsubscribeOthersRequest, current_user: User = Depends(get_current_user)):
+    """Unsubscribe (delete) push subscriptions for the current user on all other devices.
+
+    If `exclude_endpoint` is provided, that subscription is kept and all others are removed.
+    This endpoint also sends a WebSocket 'mute' message to other connected devices and closes their socket.
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    exclude = req.exclude_endpoint
+
+    # Delete subscriptions in DB for this user except optionally the excluded endpoint
+    if exclude:
+        result = await db.push_subscriptions.delete_many({"user_id": current_user.id, "endpoint": {"$ne": exclude}})
+    else:
+        result = await db.push_subscriptions.delete_many({"user_id": current_user.id})
+
+    deleted_count = result.deleted_count if hasattr(result, 'deleted_count') else 0
+
+    # Notify other websocket connections for this user to mute sounds
+    # Important: do NOT close or remove websocket connections here — clients should only stop playing sound.
+    conns = user_ws.get(current_user.id, [])[:]
+    notified = 0
+    for entry in conns:
+        try:
+            ep = entry.get('endpoint')
+            if exclude and ep == exclude:
+                continue
+            ws = entry.get('ws')
+            # Send a small JSON command telling the client to mute/disable sounds
+            try:
+                await ws.send_text(json.dumps({"type": "mute", "reason": "muted_by_user"}))
+            except Exception:
+                # Best effort: ignore send failures (do not close connection)
+                logger.debug('Failed to send mute message to websocket entry')
+            notified += 1
+        except Exception:
+            logger.exception('Error notifying websocket')
+
+    # Clean up empty mapping
+    if current_user.id in user_ws and not user_ws[current_user.id]:
+        del user_ws[current_user.id]
+
+    return {"deleted": deleted_count, "notified": notified}
+
+
+@api_router.post("/push/mute/others")
+async def mute_other_devices(req: UnsubscribeOthersRequest, current_user: User = Depends(get_current_user)):
+    """Send a 'mute' command to other connected devices of the current user without modifying push subscriptions.
+
+    If `exclude_endpoint` is provided, that connection is excluded from the mute command.
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    exclude = req.exclude_endpoint
+
+    # Notify other websocket connections for this user to mute sounds (do not close or remove sockets)
+    conns = user_ws.get(current_user.id, [])[:]
+    notified = 0
+    for entry in conns:
+        try:
+            ep = entry.get('endpoint')
+            if exclude and ep == exclude:
+                continue
+            ws = entry.get('ws')
+            try:
+                await ws.send_text(json.dumps({"type": "mute", "reason": "muted_by_user"}))
+            except Exception:
+                logger.debug('Failed to send mute message to websocket entry')
+            notified += 1
+        except Exception:
+            logger.exception('Error notifying websocket')
+
+    return {"notified": notified}
 
 @api_router.post("/push/test")
 async def test_push_notification(current_user: User = Depends(get_current_user)):
@@ -1730,6 +2358,70 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """Simple WebSocket endpoint that enforces Origin checks based on CORS_ORIGINS.
+    Clients may connect without auth for development; adjust token validation as needed.
+    """
+    origin = websocket.headers.get('origin')
+    # If ALLOWED_ORIGINS does not contain '*' and origin not in list, reject
+    if origin and '*' not in ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
+        logger.warning(f"WebSocket connection rejected from origin: {origin}")
+        await websocket.close(code=1008)
+        return
+    # Try to authenticate the socket using Authorization header (Bearer <token>)
+    user_id = None
+    try:
+        auth_header = websocket.headers.get('authorization')
+        if auth_header and auth_header.lower().startswith('bearer '):
+            token = auth_header.split(' ', 1)[1]
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get('sub')
+    except Exception:
+        user_id = None
+
+    # Fallback: allow token via query param for browser-based WS clients
+    if not user_id:
+        try:
+            token = websocket.query_params.get('token')
+            if token:
+                payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                user_id = payload.get('sub')
+        except Exception:
+            user_id = None
+
+    await websocket.accept()
+    logger.info(f"WebSocket connection accepted from origin: {origin} user_id={user_id}")
+
+    # Register this websocket for the user (optional endpoint query param)
+    try:
+        endpoint = websocket.query_params.get('endpoint')
+        if user_id:
+            entry = {"ws": websocket, "endpoint": endpoint}
+            user_ws.setdefault(user_id, []).append(entry)
+    except Exception:
+        logger.exception('Failed to register websocket')
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            # Echo or handle messages as needed; keep simple ping/pong for now
+            if msg.lower() in ("ping", "ping\n"):
+                await websocket.send_text("pong")
+            else:
+                await websocket.send_text(f"received: {msg}")
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+        # Remove from user_ws mappings if present
+        try:
+            if user_id and user_id in user_ws:
+                # Remove any entries referencing this websocket object
+                user_ws[user_id] = [e for e in user_ws[user_id] if e.get('ws') is not websocket]
+                if not user_ws[user_id]:
+                    del user_ws[user_id]
+        except Exception:
+            logger.exception('Failed to cleanup websocket mapping')
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
