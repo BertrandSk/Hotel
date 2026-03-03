@@ -2861,6 +2861,10 @@ allowed_origins = [o.strip() for o in raw_origins.split(',') if o.strip()]
 if "http://localhost:3000" not in allowed_origins:
     allowed_origins.append("http://localhost:3000")
 
+# Add production frontend domain
+if "https://lavilladelice.netlify.app" not in allowed_origins:
+    allowed_origins.append("https://lavilladelice.netlify.app")
+
 # Log the actual origins being used for debugging
 logger.info(f"Final CORS Allowed Origins: {allowed_origins}")
 
