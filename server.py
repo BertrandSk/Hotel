@@ -13,6 +13,12 @@ from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timezone, timedelta
 from jose import JWTError, jwt
+import bcrypt
+# Fix for passlib/bcrypt 4.0+ compatibility issue
+if not hasattr(bcrypt, '__about__'):
+    class About:
+        __version__ = bcrypt.__version__
+    bcrypt.__about__ = About()
 from passlib.context import CryptContext
 import qrcode
 from io import BytesIO
@@ -260,6 +266,9 @@ class RoomBookingCreate(BaseModel):
     check_out: str
     notes: Optional[str] = ""
 
+class BookingExtension(BaseModel):
+    check_out: str
+
 class AddItemToBooking(BaseModel):
     menu_item_id: str
     name: str
@@ -347,6 +356,32 @@ class CreditCreate(BaseModel):
     notes: Optional[str] = ""
     items: List[OrderItem] = Field(default_factory=list)
 
+# Message Models
+class Message(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    sender_id: str
+    receiver_id: str
+    content: str
+    read: bool = False
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class MessageCreate(BaseModel):
+    receiver_id: str
+    content: str
+
+# Audit Log Model
+class AuditLog(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    user_name: str
+    user_role: str
+    action: str
+    details: Optional[str] = ""
+    metadata: Optional[Dict] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 # ==================== HELPER FUNCTIONS ====================
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -414,6 +449,23 @@ def deserialize_datetime(doc: dict) -> dict:
         doc['created_at'] = datetime.fromisoformat(doc['created_at'])
     return doc
 
+async def log_action(user: User, action: str, details: str = "", metadata: dict = None):
+    """Log an administrative action to the database."""
+    try:
+        log = AuditLog(
+            user_id=user.id,
+            user_name=user.name,
+            user_role=user.role,
+            action=action,
+            details=details,
+            metadata=metadata or {}
+        )
+        doc = log.model_dump()
+        doc = serialize_datetime(doc)
+        await db.audit_logs.insert_one(doc)
+    except Exception as e:
+        logger.error(f"Failed to log action: {e}")
+
 # ==================== AUTH ROUTES ====================
 
 @api_router.post("/auth/register", response_model=Token)
@@ -443,7 +495,15 @@ async def register(user_data: UserCreate):
 
 @api_router.post("/auth/login", response_model=Token)
 async def login(login_data: UserLogin):
-    user_doc = await db.users.find_one({"email": login_data.email}, {"_id": 0})
+    # Normalize email input (strip whitespace)
+    email_input = login_data.email.strip()
+    
+    # Find user case-insensitively (regex search)
+    user_doc = await db.users.find_one(
+        {"email": {"$regex": f"^{email_input}$", "$options": "i"}}, 
+        {"_id": 0}
+    )
+    
     if not user_doc:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
@@ -468,18 +528,24 @@ async def get_users(admin: User = Depends(get_admin_user)):
 
 @api_router.delete("/users/{user_id}")
 async def delete_user(user_id: str, admin: User = Depends(get_admin_user)):
+    user_to_delete = await db.users.find_one({"id": user_id})
     result = await db.users.delete_one({"id": user_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
+    name = user_to_delete.get("name", "Inconnu") if user_to_delete else "Inconnu"
+    await log_action(admin, "Suppression utilisateur", f"Nom: {name} (ID: {user_id})")
     return {"message": "User deleted"}
 
 @api_router.put("/users/{user_id}/role")
 async def update_user_role(user_id: str, role: str, admin: User = Depends(get_admin_user)):
     if role not in [UserRole.ADMIN, UserRole.STAFF, UserRole.GUEST, UserRole.SERVEUR, UserRole.CUISINIER, UserRole.MAGAZINIER]:
         raise HTTPException(status_code=400, detail="Invalid role")
+    user_to_update = await db.users.find_one({"id": user_id})
     result = await db.users.update_one({"id": user_id}, {"$set": {"role": role}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
+    name = user_to_update.get("name", "Inconnu") if user_to_update else "Inconnu"
+    await log_action(admin, "Modification rôle utilisateur", f"Utilisateur: {name}, Nouveau rôle: {role}")
     return {"message": "Role updated"}
 
 # ==================== CATEGORY ROUTES ====================
@@ -533,34 +599,84 @@ async def create_menu_item(item_data: MenuItemCreate, current_user: User = Depen
     doc = item.model_dump()
     doc = serialize_datetime(doc)
     await db.menu_items.insert_one(doc)
+    
+    stock_val = item.stock_quantity if item.stock_quantity is not None else 0
+    await log_action(current_user, "Création produit", f"Nom: {item.name}, Prix: {item.price}", metadata={
+        "product_id": item.id,
+        "product_name": item.name,
+        "stock_before": 0,
+        "stock_after": stock_val,
+        "quantity_change": stock_val
+    })
     return item
 
 @api_router.put("/menu/{item_id}", response_model=MenuItem)
 async def update_menu_item(item_id: str, item_data: MenuItemCreate, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF))):
+    # Fetch old item first to get stock before update
+    old_item = await db.menu_items.find_one({"id": item_id})
+    if not old_item:
+        raise HTTPException(status_code=404, detail="Menu item not found")
+    
+    old_stock = old_item.get("stock_quantity")
+    if old_stock is None: old_stock = 0
+
     update_data = item_data.model_dump()
     result = await db.menu_items.update_one({"id": item_id}, {"$set": update_data})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Menu item not found")
+    
     updated = await db.menu_items.find_one({"id": item_id}, {"_id": 0})
+    new_stock = updated.get("stock_quantity")
+    if new_stock is None: new_stock = 0
+
+    await log_action(current_user, "Modification produit", f"Nom: {item_data.name} (ID: {item_id})", metadata={
+        "product_id": item_id,
+        "product_name": item_data.name,
+        "stock_before": old_stock,
+        "stock_after": new_stock,
+        "quantity_change": new_stock - old_stock
+    })
     return MenuItem(**deserialize_datetime(updated))
 
 @api_router.delete("/menu/{item_id}")
 async def delete_menu_item(item_id: str, admin: User = Depends(get_admin_user)):
-    result = await db.menu_items.delete_one({"id": item_id})
-    if result.deleted_count == 0:
+    item = await db.menu_items.find_one({"id": item_id})
+    if not item:
         raise HTTPException(status_code=404, detail="Menu item not found")
+        
+    stock = item.get("stock_quantity")
+    if stock is None: stock = 0
+    
+    result = await db.menu_items.delete_one({"id": item_id})
+    name = item.get("name", "Inconnu") if item else "Inconnu"
+    await log_action(admin, "Suppression produit", f"Nom: {name}", metadata={
+        "product_id": item_id,
+        "product_name": name,
+        "stock_before": stock,
+        "stock_after": 0,
+        "quantity_change": -stock
+    })
     return {"message": "Menu item deleted"}
 
 # Stock Management
 @api_router.put("/menu/{item_id}/stock")
 async def update_stock(item_id: str, quantity: int, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF))):
     """Update stock quantity for a menu item"""
+    item = await db.menu_items.find_one({"id": item_id})
+    if not item:
+        raise HTTPException(status_code=404, detail="Menu item not found")
+        
+    old_stock = item.get("stock_quantity", 0) or 0
+    
     result = await db.menu_items.update_one(
         {"id": item_id}, 
         {"$set": {"stock_quantity": quantity}}
     )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Menu item not found")
+    await log_action(current_user, "Mise à jour stock", f"ID: {item_id}, Nouvelle quantité: {quantity}", metadata={
+        "product_id": item_id,
+        "product_name": item.get("name"),
+        "stock_before": old_stock,
+        "stock_after": quantity,
+        "quantity_change": quantity - old_stock
+    })
     return {"message": "Stock updated", "quantity": quantity}
 
 @api_router.post("/menu/{item_id}/stock/add")
@@ -577,6 +693,13 @@ async def add_stock(item_id: str, quantity: int, current_user: User = Depends(re
         {"id": item_id}, 
         {"$set": {"stock_quantity": new_stock, "track_stock": True}}
     )
+    await log_action(current_user, "Ajout stock", f"Produit: {item.get('name')}, Ajout: {quantity}, Total: {new_stock}", metadata={
+        "product_id": item_id,
+        "product_name": item.get("name"),
+        "stock_before": current_stock,
+        "stock_after": new_stock,
+        "quantity_change": quantity
+    })
     return {"message": "Stock added", "new_quantity": new_stock}
 
 # ==================== DIRECT INVOICES ====================
@@ -969,6 +1092,49 @@ async def get_product_stock_history(
     }
 
 
+@api_router.get("/products/history/logs")
+async def get_products_history_logs(
+    page: int = 1,
+    per_page: int = 20,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    product_name: Optional[str] = None,
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.MAGAZINIER, UserRole.SERVEUR))
+):
+    """Get audit logs specifically for product stock changes."""
+    query = {
+        "action": {"$in": ["Ajout stock", "Mise à jour stock", "Création produit", "Suppression produit", "Modification produit"]}
+    }
+    
+    if start_date or end_date:
+        date_filter = {}
+        if start_date:
+            try:
+                s = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                date_filter["$gte"] = s.isoformat()
+            except ValueError: pass
+        if end_date:
+            try:
+                e = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
+                date_filter["$lte"] = e.isoformat()
+            except ValueError: pass
+        if date_filter:
+            query["created_at"] = date_filter
+            
+    if product_name:
+        query["metadata.product_name"] = {"$regex": product_name, "$options": "i"}
+
+    total = await db.audit_logs.count_documents(query)
+    skip = (page - 1) * per_page
+
+    logs = await db.audit_logs.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(per_page).to_list(per_page)
+    return {
+        "logs": [deserialize_datetime(l) for l in logs],
+        "total": total,
+        "page": page,
+        "per_page": per_page
+    }
+
 @api_router.get("/credits")
 async def list_credits(status: Optional[str] = None, admin: User = Depends(get_admin_user)):
     """List all credits (admin only)."""
@@ -1220,9 +1386,12 @@ async def generate_direct_invoice_pdf(invoice_id: str, current_user: User = Depe
 
 @api_router.delete("/invoices/direct/{invoice_id}")
 async def delete_direct_invoice(invoice_id: str, admin: User = Depends(get_admin_user)):
+    inv = await db.direct_invoices.find_one({"id": invoice_id})
     result = await db.direct_invoices.delete_one({"id": invoice_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Invoice not found")
+    num = inv.get("invoice_number", "Inconnu") if inv else "Inconnu"
+    await log_action(admin, "Suppression facture", f"N°: {num}")
     return {"message": "Invoice deleted"}
 
 # ==================== ROOM ROUTES ====================
@@ -1247,6 +1416,7 @@ async def update_room(room_id: str, room_data: RoomCreate, admin: User = Depends
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Room not found")
     updated = await db.rooms.find_one({"id": room_id}, {"_id": 0})
+    await log_action(admin, "Modification chambre", f"Numéro: {room_data.number}")
     return Room(**deserialize_datetime(updated))
 
 @api_router.delete("/rooms/{room_id}")
@@ -1254,6 +1424,7 @@ async def delete_room(room_id: str, admin: User = Depends(get_admin_user)):
     result = await db.rooms.delete_one({"id": room_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Room not found")
+    await log_action(admin, "Suppression chambre", f"ID: {room_id}")
     return {"message": "Room deleted"}
 
 # ==================== ROOM BOOKING ROUTES ====================
@@ -1324,6 +1495,35 @@ async def update_booking_status(booking_id: str, status: str, current_user: User
     
     return {"message": "Status updated"}
 
+@api_router.put("/bookings/{booking_id}/extend")
+async def extend_booking(booking_id: str, extension: BookingExtension, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.SERVEUR))):
+    """Extend a booking to a new checkout date"""
+    booking = await db.bookings.find_one({"id": booking_id})
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    
+    check_in_date = datetime.strptime(booking["check_in"], "%Y-%m-%d")
+    new_check_out_date = datetime.strptime(extension.check_out, "%Y-%m-%d")
+    
+    if new_check_out_date <= check_in_date:
+        raise HTTPException(status_code=400, detail="New check-out date must be after check-in date")
+        
+    nights = (new_check_out_date - check_in_date).days
+    total_price = nights * booking["price_per_night"]
+    
+    await db.bookings.update_one(
+        {"id": booking_id},
+        {"$set": {
+            "check_out": extension.check_out,
+            "nights": nights,
+            "total_price": total_price
+        }}
+    )
+    
+    await log_action(current_user, "Prolongation réservation", f"Client: {booking.get('guest_name')}, Nouveau départ: {extension.check_out}")
+    
+    return {"message": "Booking extended", "nights": nights, "total_price": total_price}
+
 @api_router.delete("/bookings/{booking_id}")
 async def delete_booking(booking_id: str, admin: User = Depends(get_admin_user)):
     booking = await db.bookings.find_one({"id": booking_id}, {"_id": 0})
@@ -1334,6 +1534,8 @@ async def delete_booking(booking_id: str, admin: User = Depends(get_admin_user))
     await db.rooms.update_one({"id": booking["room_id"]}, {"$set": {"status": "available"}})
     
     result = await db.bookings.delete_one({"id": booking_id})
+    guest = booking.get("guest_name", "Inconnu") if booking else "Inconnu"
+    await log_action(admin, "Suppression réservation", f"Client: {guest}")
     return {"message": "Booking deleted"}
 
 # Add restaurant items to booking
@@ -1805,19 +2007,19 @@ async def unsubscribe_other_devices(req: UnsubscribeOthersRequest, current_user:
 
 @api_router.post("/push/mute/others")
 async def mute_other_devices(req: UnsubscribeOthersRequest, current_user: User = Depends(get_current_user)):
-    """Send a 'mute' command to other connected devices of the current user without modifying push subscriptions.
-
-    If `exclude_endpoint` is provided, that connection is excluded from the mute command.
-    """
+    """Send a 'mute' command to ALL connected devices (global mute)."""
     if db is None:
         raise HTTPException(status_code=503, detail="Database unavailable")
 
     exclude = req.exclude_endpoint
-
-    # Notify other websocket connections for this user to mute sounds (do not close or remove sockets)
-    conns = user_ws.get(current_user.id, [])[:]
     notified = 0
-    for entry in conns:
+    
+    # Broadcast to ALL connected users (Global Mute)
+    all_connections = []
+    for user_conns in user_ws.values():
+        all_connections.extend(user_conns)
+
+    for entry in all_connections:
         try:
             ep = entry.get('endpoint')
             if exclude and ep == exclude:
@@ -2266,82 +2468,382 @@ async def generate_report_pdf(period: str = "all", date: str = None, current_use
         headers={"Content-Disposition": "attachment; filename=rapport_villa_delice.pdf"}
     )
 
+# ==================== MESSAGING ROUTES ====================
+
+@api_router.get("/messages/users")
+async def get_chat_users(current_user: User = Depends(get_current_user)):
+    """Get list of users with their last message for the chat sidebar"""
+    # Get all users (excluding password)
+    users = await db.users.find({}, {"_id": 0, "hashed_password": 0}).to_list(1000)
+    
+    # Aggregation to get last message for each conversation involving current_user
+    pipeline = [
+        {
+            "$match": {
+                "$or": [{"sender_id": current_user.id}, {"receiver_id": current_user.id}]
+            }
+        },
+        {
+            "$sort": {"created_at": -1}
+        },
+        {
+            "$group": {
+                "_id": {
+                    "$cond": [
+                        {"$eq": ["$sender_id", current_user.id]},
+                        "$receiver_id",
+                        "$sender_id"
+                    ]
+                },
+                "last_message": {"$first": "$$ROOT"}
+            }
+        }
+    ]
+    
+    conversations = await db.messages.aggregate(pipeline).to_list(1000)
+    conv_map = {c["_id"]: c["last_message"] for c in conversations}
+
+    # Aggregation to get unread counts from each user
+    unread_pipeline = [
+        {
+            "$match": {"receiver_id": current_user.id, "read": False}
+        },
+        {
+            "$group": {
+                "_id": "$sender_id",
+                "count": {"$sum": 1}
+            }
+        }
+    ]
+    unread_counts = await db.messages.aggregate(unread_pipeline).to_list(1000)
+    unread_map = {c["_id"]: c["count"] for c in unread_counts}
+    
+    result = []
+    for u in users:
+        if u["id"] == current_user.id:
+            continue
+        
+        u_dict = deserialize_datetime(u)
+        last_msg = conv_map.get(u["id"])
+        
+        if last_msg:
+            u_dict["last_message"] = last_msg.get("content")
+            u_dict["last_message_time"] = last_msg.get("created_at")
+        else:
+            u_dict["last_message"] = ""
+            u_dict["last_message_time"] = ""
+        
+        u_dict["unread_count"] = unread_map.get(u["id"], 0)
+            
+        result.append(u_dict)
+        
+    # Sort users: those with recent messages first, then by name
+    result.sort(key=lambda x: (x.get("last_message_time") or "", x.get("name")), reverse=True)
+    return result
+
+@api_router.get("/messages/{other_user_id}", response_model=List[Message])
+async def get_messages(other_user_id: str, current_user: User = Depends(get_current_user)):
+    """Get conversation history with a specific user"""
+    messages = await db.messages.find({
+        "$or": [
+            {"sender_id": current_user.id, "receiver_id": other_user_id},
+            {"sender_id": other_user_id, "receiver_id": current_user.id}
+        ]
+    }, {"_id": 0}).sort("created_at", 1).to_list(1000)
+    return [deserialize_datetime(m) for m in messages]
+
+@api_router.post("/messages", response_model=Message)
+async def send_message(msg_data: MessageCreate, current_user: User = Depends(get_current_user)):
+    """Send a message to another user"""
+    msg = Message(
+        sender_id=current_user.id,
+        receiver_id=msg_data.receiver_id,
+        content=msg_data.content
+    )
+    doc = msg.model_dump()
+    doc = serialize_datetime(doc)
+    await db.messages.insert_one(doc)
+    
+    # Real-time notification via WebSocket if receiver is connected
+    receiver_conns = user_ws.get(msg_data.receiver_id, [])
+    for entry in receiver_conns:
+        try:
+            ws = entry.get("ws")
+            # Send simple event payload
+            message_payload = deserialize_datetime(doc)
+            message_payload['sender_name'] = current_user.name # Add sender name here
+            await ws.send_text(json.dumps({
+                "type": "new_message",
+                "message": message_payload
+            }))
+        except Exception:
+            pass
+            
+    return deserialize_datetime(doc)
+
+@api_router.post("/messages/mark-as-read")
+async def mark_messages_as_read(payload: Dict[str, str], current_user: User = Depends(get_current_user)):
+    """Mark messages from a specific sender as read."""
+    other_user_id = payload.get("other_user_id")
+    if not other_user_id:
+        raise HTTPException(status_code=400, detail="other_user_id is required")
+
+    await db.messages.update_many(
+        {"receiver_id": current_user.id, "sender_id": other_user_id, "read": False},
+        {"$set": {"read": True}}
+    )
+    # Return the new unread count
+    return await get_unread_message_count(current_user)
+
+@api_router.get("/messages/unread-count")
+async def get_unread_message_count(current_user: User = Depends(get_current_user)):
+    """Get the count of unread messages for the current user."""
+    count = await db.messages.count_documents({
+        "receiver_id": current_user.id,
+        "read": False
+    })
+    return {"count": count}
+
+# ==================== MESSAGING ROUTES ====================
+
+@api_router.get("/messages/users")
+async def get_chat_users(current_user: User = Depends(get_current_user)):
+    """Get list of users with their last message for the chat sidebar"""
+    # Get all users (excluding password)
+    users = await db.users.find({}, {"_id": 0, "hashed_password": 0}).to_list(1000)
+    
+    # Aggregation to get last message for each conversation involving current_user
+    pipeline = [
+        {
+            "$match": {
+                "$or": [{"sender_id": current_user.id}, {"receiver_id": current_user.id}]
+            }
+        },
+        {
+            "$sort": {"created_at": -1}
+        },
+        {
+            "$group": {
+                "_id": {
+                    "$cond": [
+                        {"$eq": ["$sender_id", current_user.id]},
+                        "$receiver_id",
+                        "$sender_id"
+                    ]
+                },
+                "last_message": {"$first": "$$ROOT"}
+            }
+        }
+    ]
+    
+    conversations = await db.messages.aggregate(pipeline).to_list(1000)
+    conv_map = {c["_id"]: c["last_message"] for c in conversations}
+    
+    result = []
+    for u in users:
+        if u["id"] == current_user.id:
+            continue
+        
+        u_dict = deserialize_datetime(u)
+        last_msg = conv_map.get(u["id"])
+        
+        if last_msg:
+            u_dict["last_message"] = last_msg.get("content")
+            u_dict["last_message_time"] = last_msg.get("created_at")
+        else:
+            u_dict["last_message"] = ""
+            u_dict["last_message_time"] = ""
+            
+        result.append(u_dict)
+        
+    # Sort users: those with recent messages first, then by name
+    result.sort(key=lambda x: (x.get("last_message_time") or "", x.get("name")), reverse=True)
+    return result
+
+@api_router.get("/messages/{other_user_id}", response_model=List[Message])
+async def get_messages(other_user_id: str, current_user: User = Depends(get_current_user)):
+    """Get conversation history with a specific user"""
+    messages = await db.messages.find({
+        "$or": [
+            {"sender_id": current_user.id, "receiver_id": other_user_id},
+            {"sender_id": other_user_id, "receiver_id": current_user.id}
+        ]
+    }, {"_id": 0}).sort("created_at", 1).to_list(1000)
+    return [deserialize_datetime(m) for m in messages]
+
+@api_router.post("/messages", response_model=Message)
+async def send_message(msg_data: MessageCreate, current_user: User = Depends(get_current_user)):
+    """Send a message to another user"""
+    msg = Message(
+        sender_id=current_user.id,
+        receiver_id=msg_data.receiver_id,
+        content=msg_data.content
+    )
+    doc = msg.model_dump()
+    doc = serialize_datetime(doc)
+    await db.messages.insert_one(doc)
+    
+    # Real-time notification via WebSocket if receiver is connected
+    receiver_conns = user_ws.get(msg_data.receiver_id, [])
+    for entry in receiver_conns:
+        try:
+            ws = entry.get("ws")
+            # Send simple event payload
+            await ws.send_text(json.dumps({
+                "type": "new_message",
+                "message": deserialize_datetime(doc)
+            }))
+        except Exception:
+            pass
+            
+    return deserialize_datetime(doc)
+
+@api_router.get("/messages/unread-count")
+async def get_unread_message_count(current_user: User = Depends(get_current_user)):
+    """Get the count of unread messages for the current user."""
+    count = await db.messages.count_documents({
+        "receiver_id": current_user.id,
+        "read": False
+    })
+    return {"count": count}
+
+# ==================== AUDIT LOGS ROUTES ====================
+
+@api_router.get("/audit-logs")
+async def get_audit_logs(
+    page: int = 1,
+    per_page: int = 20,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: User = Depends(get_admin_user)
+):
+    """Get audit logs (admin only)."""
+    query = {}
+    if start_date or end_date:
+        date_filter = {}
+        if start_date:
+            try:
+                s = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                date_filter["$gte"] = s.isoformat()
+            except ValueError:
+                pass
+        if end_date:
+            try:
+                e = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
+                date_filter["$lte"] = e.isoformat()
+            except ValueError:
+                pass
+        if date_filter:
+            query["created_at"] = date_filter
+
+    total = await db.audit_logs.count_documents(query)
+    skip = (page - 1) * per_page
+    
+    logs = await db.audit_logs.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(per_page).to_list(per_page)
+    return {
+        "logs": [deserialize_datetime(l) for l in logs],
+        "total": total,
+        "page": page,
+        "per_page": per_page
+    }
+
 # ==================== SEED DATA ====================
 
 @api_router.post("/seed")
 async def seed_data():
-    """Seed initial data for demo purposes"""
-    # Check if data already exists
-    existing_users = await db.users.count_documents({})
-    if existing_users > 0:
-        return {"message": "Data already seeded"}
+    """Seed initial data for demo purposes. This is now idempotent for key users and data."""
+
+    # --- Upsert admin user ---
+    admin_email = "admin@hotel.com"
+    admin_user = await db.users.find_one({"email": admin_email})
+    if not admin_user:
+        admin = UserInDB(
+            id=str(uuid.uuid4()),
+            email=admin_email,
+            name="Administrateur",
+            role=UserRole.ADMIN,
+            hashed_password=get_password_hash("admin123")
+        )
+        admin_doc = admin.model_dump()
+        admin_doc = serialize_datetime(admin_doc)
+        await db.users.insert_one(admin_doc)
+
+    # --- Force Reset 'sept' user to ensure password is correct ---
+    sept_email = "sept@gmail.com"
     
-    # Create admin user
-    admin = UserInDB(
+    # Delete any existing user with this email (case insensitive) to avoid conflicts
+    await db.users.delete_many({"email": {"$regex": f"^{sept_email}$", "$options": "i"}})
+    
+    # Create fresh user with known password
+    sept = UserInDB(
         id=str(uuid.uuid4()),
-        email="admin@hotel.com",
-        name="Administrateur",
-        role=UserRole.ADMIN,
-        hashed_password=get_password_hash("admin123")
+        email=sept_email,
+        name="Bertrand Sept",
+        role=UserRole.SERVEUR,
+        hashed_password=get_password_hash("123456")
     )
-    admin_doc = admin.model_dump()
-    admin_doc = serialize_datetime(admin_doc)
-    await db.users.insert_one(admin_doc)
-    
-    # Create categories
-    categories_data = [
-        {"name": "Entrées", "type": "food", "description": "Nos délicieuses entrées"},
-        {"name": "Plats Principaux", "type": "food", "description": "Nos plats signatures"},
-        {"name": "Desserts", "type": "food", "description": "Finissez en beauté"},
-        {"name": "Cocktails", "type": "drink", "description": "Nos créations originales"},
-        {"name": "Vins", "type": "drink", "description": "Sélection de vins fins"},
-        {"name": "Boissons Chaudes", "type": "drink", "description": "Café, thé et plus"},
-    ]
-    
-    category_ids = {}
-    for cat_data in categories_data:
-        cat = Category(**cat_data)
-        doc = cat.model_dump()
-        doc = serialize_datetime(doc)
-        await db.categories.insert_one(doc)
-        category_ids[cat_data["name"]] = cat.id
-    
-    # Create menu items
-    menu_items_data = [
-        {"name": "Soupe du Jour", "description": "Préparation fraîche quotidienne", "price": 8.50, "category_id": category_ids["Entrées"], "image_url": "https://images.unsplash.com/photo-1547592166-23ac45744acd?w=400"},
-        {"name": "Salade César", "description": "Laitue romaine, parmesan, croûtons", "price": 12.00, "category_id": category_ids["Entrées"], "image_url": "https://images.unsplash.com/photo-1546793665-c74683f339c1?w=400"},
-        {"name": "Steak Frites", "description": "Entrecôte grillée, frites maison", "price": 28.00, "category_id": category_ids["Plats Principaux"], "image_url": "https://images.unsplash.com/photo-1600891964092-4316c288032e?w=400"},
-        {"name": "Saumon Grillé", "description": "Filet de saumon, légumes de saison", "price": 25.00, "category_id": category_ids["Plats Principaux"], "image_url": "https://images.unsplash.com/photo-1467003909585-2f8a72700288?w=400"},
-        {"name": "Risotto aux Champignons", "description": "Riz arborio, champignons variés", "price": 22.00, "category_id": category_ids["Plats Principaux"], "image_url": "https://images.unsplash.com/photo-1476124369491-e7addf5db371?w=400"},
-        {"name": "Tiramisu", "description": "Recette italienne traditionnelle", "price": 9.00, "category_id": category_ids["Desserts"], "image_url": "https://images.unsplash.com/photo-1571877227200-a0d98ea607e9?w=400"},
-        {"name": "Crème Brûlée", "description": "Vanille de Madagascar", "price": 8.50, "category_id": category_ids["Desserts"], "image_url": "https://images.unsplash.com/photo-1470124182917-cc6e71b22ecc?w=400"},
-        {"name": "Mojito", "description": "Rhum, menthe fraîche, citron vert", "price": 12.00, "category_id": category_ids["Cocktails"], "image_url": "https://images.unsplash.com/photo-1551538827-9c037cb4f32a?w=400"},
-        {"name": "Martini Espresso", "description": "Vodka, café, liqueur de café", "price": 14.00, "category_id": category_ids["Cocktails"], "image_url": "https://images.unsplash.com/photo-1545438102-799c3991ffef?w=400"},
-        {"name": "Bordeaux Rouge", "description": "Saint-Émilion Grand Cru", "price": 45.00, "category_id": category_ids["Vins"], "image_url": "https://images.unsplash.com/photo-1510812431401-41d2bd2722f3?w=400"},
-        {"name": "Café Expresso", "description": "Torréfaction artisanale", "price": 3.50, "category_id": category_ids["Boissons Chaudes"], "image_url": "https://images.unsplash.com/photo-1510707577719-ae7c14805e3a?w=400"},
-    ]
-    
-    for item_data in menu_items_data:
-        item = MenuItem(**item_data)
-        doc = item.model_dump()
-        doc = serialize_datetime(doc)
-        await db.menu_items.insert_one(doc)
-    
-    # Create rooms
-    rooms_data = [
-        {"number": "101", "type": "single", "price_per_night": 120.00, "description": "Chambre simple avec vue jardin", "image_url": "https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=400"},
-        {"number": "102", "type": "double", "price_per_night": 180.00, "description": "Chambre double standard", "image_url": "https://images.unsplash.com/photo-1590490360182-c33d57733427?w=400"},
-        {"number": "201", "type": "suite", "price_per_night": 350.00, "description": "Suite de luxe avec terrasse", "image_url": "https://images.unsplash.com/photo-1582719478250-c89cae4dc85b?w=400"},
-        {"number": "202", "type": "double", "price_per_night": 200.00, "description": "Chambre double vue mer", "image_url": "https://images.unsplash.com/photo-1566665797739-1674de7a421a?w=400"},
-    ]
-    
-    for room_data in rooms_data:
-        room = Room(**room_data)
-        doc = room.model_dump()
-        doc = serialize_datetime(doc)
-        await db.rooms.insert_one(doc)
-    
-    return {"message": "Data seeded successfully", "admin_email": "admin@hotel.com", "admin_password": "admin123"}
+    sept_doc = sept.model_dump()
+    sept_doc = serialize_datetime(sept_doc)
+    await db.users.insert_one(sept_doc)
+    logger.info(f"User {sept_email} has been reset with password '123456'")
+
+    # --- Seed other data only if it's missing ---
+    existing_categories = await db.categories.count_documents({})
+    if existing_categories == 0:
+        # Create categories
+        categories_data = [
+            {"name": "Entrées", "type": "food", "description": "Nos délicieuses entrées"},
+            {"name": "Plats Principaux", "type": "food", "description": "Nos plats signatures"},
+            {"name": "Desserts", "type": "food", "description": "Finissez en beauté"},
+            {"name": "Cocktails", "type": "drink", "description": "Nos créations originales"},
+            {"name": "Vins", "type": "drink", "description": "Sélection de vins fins"},
+            {"name": "Boissons Chaudes", "type": "drink", "description": "Café, thé et plus"},
+        ]
+        
+        category_ids = {}
+        for cat_data in categories_data:
+            cat = Category(**cat_data)
+            doc = cat.model_dump()
+            doc = serialize_datetime(doc)
+            await db.categories.insert_one(doc)
+            category_ids[cat_data["name"]] = cat.id
+        
+        # Create menu items
+        menu_items_data = [
+            {"name": "Soupe du Jour", "description": "Préparation fraîche quotidienne", "price": 8.50, "category_id": category_ids["Entrées"], "image_url": "https://images.unsplash.com/photo-1547592166-23ac45744acd?w=400"},
+            {"name": "Salade César", "description": "Laitue romaine, parmesan, croûtons", "price": 12.00, "category_id": category_ids["Entrées"], "image_url": "https://images.unsplash.com/photo-1546793665-c74683f339c1?w=400"},
+            {"name": "Steak Frites", "description": "Entrecôte grillée, frites maison", "price": 28.00, "category_id": category_ids["Plats Principaux"], "image_url": "https://images.unsplash.com/photo-1600891964092-4316c288032e?w=400"},
+            {"name": "Saumon Grillé", "description": "Filet de saumon, légumes de saison", "price": 25.00, "category_id": category_ids["Plats Principaux"], "image_url": "https://images.unsplash.com/photo-1467003909585-2f8a72700288?w=400"},
+            {"name": "Risotto aux Champignons", "description": "Riz arborio, champignons variés", "price": 22.00, "category_id": category_ids["Plats Principaux"], "image_url": "https://images.unsplash.com/photo-1476124369491-e7addf5db371?w=400"},
+            {"name": "Tiramisu", "description": "Recette italienne traditionnelle", "price": 9.00, "category_id": category_ids["Desserts"], "image_url": "https://images.unsplash.com/photo-1571877227200-a0d98ea607e9?w=400"},
+            {"name": "Crème Brûlée", "description": "Vanille de Madagascar", "price": 8.50, "category_id": category_ids["Desserts"], "image_url": "https://images.unsplash.com/photo-1470124182917-cc6e71b22ecc?w=400"},
+            {"name": "Mojito", "description": "Rhum, menthe fraîche, citron vert", "price": 12.00, "category_id": category_ids["Cocktails"], "image_url": "https://images.unsplash.com/photo-1551538827-9c037cb4f32a?w=400"},
+            {"name": "Martini Espresso", "description": "Vodka, café, liqueur de café", "price": 14.00, "category_id": category_ids["Cocktails"], "image_url": "https://images.unsplash.com/photo-1545438102-799c3991ffef?w=400"},
+            {"name": "Bordeaux Rouge", "description": "Saint-Émilion Grand Cru", "price": 45.00, "category_id": category_ids["Vins"], "image_url": "https://images.unsplash.com/photo-1510812431401-41d2bd2722f3?w=400"},
+            {"name": "Café Expresso", "description": "Torréfaction artisanale", "price": 3.50, "category_id": category_ids["Boissons Chaudes"], "image_url": "https://images.unsplash.com/photo-1510707577719-ae7c14805e3a?w=400"},
+        ]
+        
+        for item_data in menu_items_data:
+            item = MenuItem(**item_data)
+            doc = item.model_dump()
+            doc = serialize_datetime(doc)
+            await db.menu_items.insert_one(doc)
+        
+        # Create rooms
+        rooms_data = [
+            {"number": "101", "type": "single", "price_per_night": 120.00, "description": "Chambre simple avec vue jardin", "image_url": "https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=400"},
+            {"number": "102", "type": "double", "price_per_night": 180.00, "description": "Chambre double standard", "image_url": "https://images.unsplash.com/photo-1590490360182-c33d57733427?w=400"},
+            {"number": "201", "type": "suite", "price_per_night": 350.00, "description": "Suite de luxe avec terrasse", "image_url": "https://images.unsplash.com/photo-1582719478250-c89cae4dc85b?w=400"},
+            {"number": "202", "type": "double", "price_per_night": 200.00, "description": "Chambre double vue mer", "image_url": "https://images.unsplash.com/photo-1566665797739-1674de7a421a?w=400"},
+        ]
+        
+        for room_data in rooms_data:
+            room = Room(**room_data)
+            doc = room.model_dump()
+            doc = serialize_datetime(doc)
+            await db.rooms.insert_one(doc)
+
+    return {"message": "Data seeding check complete. Core users are present and passwords are set."}
 
 # Root endpoint
 @api_router.get("/")
@@ -2351,10 +2853,21 @@ async def root():
 # Include the router in the main app
 app.include_router(api_router)
 
+# Get origins from env var. Default to an empty string.
+raw_origins = os.environ.get('CORS_ORIGINS', '')
+allowed_origins = [o.strip() for o in raw_origins.split(',') if o.strip()]
+
+# For local development, always allow localhost:3000
+if "http://localhost:3000" not in allowed_origins:
+    allowed_origins.append("http://localhost:3000")
+
+# Log the actual origins being used for debugging
+logger.info(f"Final CORS Allowed Origins: {allowed_origins}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=allowed_origins if allowed_origins else ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -2422,6 +2935,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     del user_ws[user_id]
         except Exception:
             logger.exception('Failed to cleanup websocket mapping')
+
+@app.on_event("startup")
+async def startup_event():
+    if DB_AVAILABLE:
+        try:
+            await seed_data()
+            logger.info("Automatic startup seeding executed successfully.")
+        except Exception as e:
+            logger.error(f"Error during startup seeding: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
