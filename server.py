@@ -640,7 +640,7 @@ async def get_menu_item(item_id: str):
     return MenuItem(**deserialize_datetime(item))
 
 @api_router.post("/menu", response_model=MenuItem)
-async def create_menu_item(item_data: MenuItemCreate, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF))):
+async def create_menu_item(item_data: MenuItemCreate, current_user: User = Depends(require_roles(UserRole.ADMIN))):
     item = MenuItem(**item_data.model_dump())
     doc = item.model_dump()
     doc = serialize_datetime(doc)
@@ -657,7 +657,7 @@ async def create_menu_item(item_data: MenuItemCreate, current_user: User = Depen
     return item
 
 @api_router.put("/menu/{item_id}", response_model=MenuItem)
-async def update_menu_item(item_id: str, item_data: MenuItemCreate, current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF))):
+async def update_menu_item(item_id: str, item_data: MenuItemCreate, current_user: User = Depends(require_roles(UserRole.ADMIN))):
     # Fetch old item first to get stock before update
     old_item = await db.menu_items.find_one({"id": item_id})
     if not old_item:
