@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict
+import re
 import uuid
 from datetime import datetime, timezone, timedelta
 from jose import JWTError, jwt
@@ -275,6 +276,13 @@ class AddItemToBooking(BaseModel):
     price: float
     quantity: int
 
+# Stock Exit Model
+class StockExit(BaseModel):
+    quantity: int
+    reason: str  # "casse", "perime", "vol", "consommation_interne", "autre"
+    notes: Optional[str] = ""
+    date: Optional[str] = None
+
 # Direct Invoice Model
 class DirectInvoice(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -449,7 +457,7 @@ def deserialize_datetime(doc: dict) -> dict:
         doc['created_at'] = datetime.fromisoformat(doc['created_at'])
     return doc
 
-async def log_action(user: User, action: str, details: str = "", metadata: dict = None):
+async def log_action(user: User, action: str, details: str = "", metadata: dict = None, timestamp: datetime = None):
     """Log an administrative action to the database."""
     try:
         log = AuditLog(
@@ -458,7 +466,8 @@ async def log_action(user: User, action: str, details: str = "", metadata: dict 
             user_role=user.role,
             action=action,
             details=details,
-            metadata=metadata or {}
+            metadata=metadata or {},
+            created_at=timestamp or datetime.now(timezone.utc)
         )
         doc = log.model_dump()
         doc = serialize_datetime(doc)
@@ -495,19 +504,29 @@ async def register(user_data: UserCreate):
 
 @api_router.post("/auth/login", response_model=Token)
 async def login(login_data: UserLogin):
+    logger.info(f"⚡ TENTATIVE DE CONNEXION REÇUE pour : {login_data.email}")
     # Normalize email input (strip whitespace)
     email_input = login_data.email.strip()
     
+    # Escape regex special characters to prevent errors
+    safe_email = re.escape(email_input)
+    
     # Find user case-insensitively (regex search)
     user_doc = await db.users.find_one(
-        {"email": {"$regex": f"^{email_input}$", "$options": "i"}}, 
+        {"email": {"$regex": f"^{safe_email}$", "$options": "i"}}, 
         {"_id": 0}
     )
     
     if not user_doc:
+        logger.warning(f"LOGIN DEBUG: User '{email_input}' not found in DB.")
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    if not verify_password(login_data.password, user_doc.get("hashed_password", "")):
+    # Verify password with debug log
+    is_valid = verify_password(login_data.password, user_doc.get("hashed_password", ""))
+    logger.info(f"LOGIN DEBUG: User found. Password valid? {is_valid}")
+
+    if not is_valid:
+        logger.warning(f"LOGIN DEBUG: Password mismatch for {email_input}")
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
     user_doc = deserialize_datetime(user_doc)
@@ -518,6 +537,33 @@ async def login(login_data: UserLogin):
 @api_router.get("/auth/me", response_model=User)
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+# ==================== DEBUG ROUTES ====================
+@api_router.get("/debug/force-reset")
+async def force_reset_user():
+    """Route de secours pour réinitialiser manuellement l'utilisateur sept@gmail.com"""
+    if db is None:
+        return {"error": "Database not connected"}
+        
+    email = "sept@gmail.com"
+    password = "123456"
+    hashed = get_password_hash(password)
+    
+    # 1. Supprimer l'ancien (pour être sûr à 100%)
+    await db.users.delete_many({"email": {"$regex": f"^{email}$", "$options": "i"}})
+    
+    # 2. Recréer le nouveau
+    user = UserInDB(
+        id=str(uuid.uuid4()),
+        email=email,
+        name="Bertrand Sept",
+        role=UserRole.SERVEUR,
+        hashed_password=hashed
+    )
+    doc = serialize_datetime(user.model_dump())
+    await db.users.insert_one(doc)
+    
+    return {"message": f"SUCCÈS : Utilisateur {email} recréé avec le mot de passe {password}. Réessaie de te connecter !"}
 
 # ==================== USER MANAGEMENT (ADMIN ONLY) ====================
 
@@ -701,6 +747,48 @@ async def add_stock(item_id: str, quantity: int, current_user: User = Depends(re
         "quantity_change": quantity
     })
     return {"message": "Stock added", "new_quantity": new_stock}
+
+@api_router.post("/menu/{item_id}/stock/remove")
+async def remove_stock(
+    item_id: str, 
+    payload: StockExit, 
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.MAGAZINIER))
+):
+    """Remove stock from a menu item (for breakage, spoilage, etc.)"""
+    item = await db.menu_items.find_one({"id": item_id}, {"_id": 0})
+    if not item:
+        raise HTTPException(status_code=404, detail="Menu item not found")
+    
+    current_stock = item.get("stock_quantity", 0) or 0
+    new_stock = max(0, current_stock - payload.quantity)
+    
+    await db.menu_items.update_one(
+        {"id": item_id}, 
+        {"$set": {"stock_quantity": new_stock, "track_stock": True}}
+    )
+    
+    details = f"Produit: {item.get('name')}, Retrait: {payload.quantity}, Motif: {payload.reason}"
+    if payload.notes:
+        details += f" ({payload.notes})"
+
+    # Handle custom date if provided
+    action_date = None
+    if payload.date:
+        try:
+            action_date = datetime.strptime(payload.date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    await log_action(current_user, "Sortie stock", details, metadata={
+        "product_id": item_id,
+        "product_name": item.get("name"),
+        "stock_before": current_stock,
+        "stock_after": new_stock,
+        "quantity_change": -payload.quantity,
+        "reason": payload.reason,
+        "notes": payload.notes
+    }, timestamp=action_date)
+    return {"message": "Stock removed", "new_quantity": new_stock}
 
 # ==================== DIRECT INVOICES ====================
 
@@ -1103,7 +1191,7 @@ async def get_products_history_logs(
 ):
     """Get audit logs specifically for product stock changes."""
     query = {
-        "action": {"$in": ["Ajout stock", "Mise à jour stock", "Création produit", "Suppression produit", "Modification produit"]}
+        "action": {"$in": ["Ajout stock", "Sortie stock", "Mise à jour stock", "Création produit", "Suppression produit", "Modification produit"]}
     }
     
     if start_date or end_date:
@@ -2139,6 +2227,126 @@ async def get_stats(current_user: User = Depends(get_current_user)):
         "total_revenue": total_revenue
     }
 
+@api_router.get("/reports/stock-exits")
+async def get_stock_exits(
+    page: int = 1,
+    per_page: int = 20,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.MAGAZINIER))
+):
+    """Get list of stock exits (losses)"""
+    query = {"action": "Sortie stock"}
+    
+    if start_date or end_date:
+        date_filter = {}
+        if start_date:
+            try:
+                s = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                date_filter["$gte"] = s.isoformat()
+            except ValueError: pass
+        if end_date:
+            try:
+                e = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
+                date_filter["$lte"] = e.isoformat()
+            except ValueError: pass
+        if date_filter:
+            query["created_at"] = date_filter
+
+    total = await db.audit_logs.count_documents(query)
+    skip = (page - 1) * per_page
+    logs = await db.audit_logs.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(per_page).to_list(per_page)
+    
+    return {
+        "logs": [deserialize_datetime(l) for l in logs],
+        "total": total,
+        "page": page,
+        "per_page": per_page
+    }
+
+@api_router.get("/reports/stock-exits/pdf")
+async def generate_stock_exits_pdf(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.STAFF, UserRole.MAGAZINIER))
+):
+    """Générer un rapport PDF des sorties de stock (Pertes, Casse, etc.)"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    query = {"action": "Sortie stock"}
+    
+    # Filtre par date
+    if start_date or end_date:
+        date_filter = {}
+        if start_date:
+            try:
+                s = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                date_filter["$gte"] = s.isoformat()
+            except ValueError: pass
+        if end_date:
+            try:
+                e = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc)
+                date_filter["$lte"] = e.isoformat()
+            except ValueError: pass
+        if date_filter:
+            query["created_at"] = date_filter
+
+    logs = await db.audit_logs.find(query).sort("created_at", -1).to_list(1000)
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+    elements = []
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('Title', parent=styles['Heading1'], alignment=1, spaceAfter=20)
+    
+    elements.append(Paragraph("Rapport des Pertes / Sorties de Stock", title_style))
+    elements.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles['Normal']))
+    elements.append(Spacer(1, 20))
+
+    data = [["Date", "Produit", "Qté", "Motif", "Auteur"]]
+    
+    for log in logs:
+        # Formatage de la date
+        created_at = log.get("created_at")
+        date_str = ""
+        if isinstance(created_at, str):
+            try:
+                dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                date_str = dt.strftime("%d/%m/%Y %H:%M")
+            except:
+                date_str = created_at[:10]
+        
+        meta = log.get("metadata", {})
+        product_name = meta.get("product_name", "Inconnu")
+        qty = str(abs(meta.get("quantity_change", 0)))
+        reason = meta.get("reason", "Autre")
+        user = log.get("user_name", "Inconnu")
+        
+        data.append([date_str, product_name, qty, reason, user])
+
+    table = Table(data, colWidths=[3.5*cm, 6*cm, 2*cm, 4*cm, 3.5*cm])
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+    ]))
+    
+    elements.append(table)
+    doc.build(elements)
+    buffer.seek(0)
+    
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=rapport_pertes.pdf"}
+    )
+
 @api_router.get("/reports/daily")
 async def get_daily_report(date: str = None, current_user: User = Depends(get_current_user)):
     """Get daily report for a specific date (format: YYYY-MM-DD)"""
@@ -2771,21 +2979,29 @@ async def seed_data():
     # --- Force Reset 'sept' user to ensure password is correct ---
     sept_email = "sept@gmail.com"
     
-    # Delete any existing user with this email (case insensitive) to avoid conflicts
-    await db.users.delete_many({"email": {"$regex": f"^{sept_email}$", "$options": "i"}})
+    # Check if user exists (case insensitive)
+    existing_sept = await db.users.find_one({"email": {"$regex": f"^{sept_email}$", "$options": "i"}})
     
-    # Create fresh user with known password
-    sept = UserInDB(
-        id=str(uuid.uuid4()),
-        email=sept_email,
-        name="Bertrand Sept",
-        role=UserRole.SERVEUR,
-        hashed_password=get_password_hash("123456")
-    )
-    sept_doc = sept.model_dump()
-    sept_doc = serialize_datetime(sept_doc)
-    await db.users.insert_one(sept_doc)
-    logger.info(f"User {sept_email} has been reset with password '123456'")
+    if existing_sept:
+        # Update existing user password and role
+        await db.users.update_one(
+            {"_id": existing_sept["_id"]},
+            {"$set": {"hashed_password": get_password_hash("123456"), "role": UserRole.SERVEUR, "name": "Bertrand Sept"}}
+        )
+        logger.info(f"User {sept_email} updated with reset password '123456'")
+    else:
+        # Create fresh user
+        sept = UserInDB(
+            id=str(uuid.uuid4()),
+            email=sept_email,
+            name="Bertrand Sept",
+            role=UserRole.SERVEUR,
+            hashed_password=get_password_hash("123456")
+        )
+        sept_doc = sept.model_dump()
+        sept_doc = serialize_datetime(sept_doc)
+        await db.users.insert_one(sept_doc)
+        logger.info(f"User {sept_email} created with password '123456'")
 
     # --- Seed other data only if it's missing ---
     existing_categories = await db.categories.count_documents({})
