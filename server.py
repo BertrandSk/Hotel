@@ -1701,7 +1701,7 @@ async def get_booking_invoice(booking_id: str):
     restaurant_items = booking.get("restaurant_items", [])
     restaurant_total = booking.get("restaurant_total", 0)
     subtotal = room_total + restaurant_total
-    tax = subtotal * 0.1
+    tax = 0
     
     return {
         "invoice_number": f"HTL-{booking_id[:8].upper()}",
@@ -1720,7 +1720,7 @@ async def get_booking_invoice(booking_id: str):
         "restaurant_total": restaurant_total,
         "subtotal": subtotal,
         "tax": tax,
-        "total": subtotal + tax,
+        "total": subtotal,
         "status": booking.get("status", ""),
         "notes": booking.get("notes", ""),
         "created_at": booking.get("created_at", "")
